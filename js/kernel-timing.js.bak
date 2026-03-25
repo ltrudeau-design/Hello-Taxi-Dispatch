@@ -1,0 +1,1897 @@
+// ============================================================================
+// KERNEL-TIMING.JS v2.0
+// Centralized Timing System: Google Directions API ETAs, Phase Management, LLM Integration
+// Dependencies: kernel-core.js (CONFIG, DATA, STATE, save(), WeatherService, TrafficService, ContextBuilder)
+// ============================================================================
+
+(function() {
+    'use strict';
+
+    // ========================================================================
+    // TIMING CONSTANTS
+    // ========================================================================
+    
+    var TIMING_CONSTANTS = {
+        URBAN_ROUTE_FACTOR: 1.35,      // Roads 35% longer than straight-line (fallback only)
+        BASE_CITY_SPEED: 40,            // km/h average urban speed (fallback only)
+        MIN_APPROACH_TIME: 2,           // minutes (can't be instant)
+        DISPATCH_OVERHEAD: 1,           // minutes (call handling)
+        MAX_COMBINED_MULTIPLIER: 1.8,   // Cap to prevent runaway
+        AVG_TRIP_DURATION: 10,          // minutes (for queue calc)
+        ETA_CACHE_TTL: 90000,           // 90 seconds cache TTL for driver ETAs
+        API_TIMEOUT: 8000,              // 8 second timeout for API calls
+        
+        WEATHER_MULTIPLIERS: {
+            'clear': 1.0,
+            'rain': 1.12,
+            'snow': 1.35,
+            'fog': 1.20
+        },
+        
+        TEMPORAL_MULTIPLIERS: {
+            'rush_hour': 1.2,
+            'lunch_hour': 1.1,
+            'evening': 1.05,
+            'night': 0.95,
+            'weekend': 0.95
+        }
+    };
+    
+    // ========================================================================
+    // ETA CACHE SYSTEM
+    // ========================================================================
+    
+    // Cache structure: { 'driverId-lat-lon': { eta: Number, timestamp: Number, source: String } }
+    var driverETACache = {};
+    
+    /**
+     * Generate cache key for driver ETA
+     */
+    function getCacheKey(driverId, destLat, destLon) {
+        // Round coords to 4 decimal places (~11m precision) for cache hits
+        return driverId + '-' + destLat.toFixed(4) + '-' + destLon.toFixed(4);
+    }
+    
+    /**
+     * Get cached ETA if valid
+     */
+    function getCachedETA(driverId, destLat, destLon) {
+        var key = getCacheKey(driverId, destLat, destLon);
+        var cached = driverETACache[key];
+        
+        if (cached && (Date.now() - cached.timestamp) < TIMING_CONSTANTS.ETA_CACHE_TTL) {
+            console.log('📦 Cache hit for driver ' + driverId + ': ' + cached.eta + ' min');
+            return cached;
+        }
+        return null;
+    }
+    
+    /**
+     * Store ETA in cache
+     */
+    function cacheETA(driverId, destLat, destLon, eta, source) {
+        var key = getCacheKey(driverId, destLat, destLon);
+        driverETACache[key] = {
+            eta: eta,
+            timestamp: Date.now(),
+            source: source || 'api'
+        };
+        console.log('📦 Cached ETA for driver ' + driverId + ': ' + eta + ' min (' + source + ')');
+    }
+    
+    /**
+     * Clear expired cache entries
+     */
+    function cleanETACache() {
+        var now = Date.now();
+        var cleaned = 0;
+        Object.keys(driverETACache).forEach(function(key) {
+            if ((now - driverETACache[key].timestamp) >= TIMING_CONSTANTS.ETA_CACHE_TTL) {
+                delete driverETACache[key];
+                cleaned++;
+            }
+        });
+        if (cleaned > 0) {
+            console.log('🧹 Cleaned ' + cleaned + ' expired ETA cache entries');
+        }
+    }
+    
+    // Clean cache every 60 seconds
+    setInterval(cleanETACache, 60000);
+
+    // ========================================================================
+    // UTILITIES
+    // ========================================================================
+    
+    /**
+     * Calculate distance between two coordinates using Haversine formula
+     * Returns straight-line distance in km
+     */
+    function haversineDistance(lat1, lon1, lat2, lon2) {
+        var R = 6371; // Earth radius in km
+        var dLat = (lat2 - lat1) * Math.PI / 180;
+        var dLon = (lon2 - lon1) * Math.PI / 180;
+        var a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+        var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+    }
+    
+    /**
+     * Calculate realistic route distance (applies urban routing factor)
+     */
+    function calculateRouteDistance(lat1, lon1, lat2, lon2) {
+        var straightLine = haversineDistance(lat1, lon1, lat2, lon2);
+        return straightLine * TIMING_CONSTANTS.URBAN_ROUTE_FACTOR;
+    }
+    
+    /**
+     * Get weather speed multiplier
+     */
+    function getWeatherMultiplier(weather) {
+        if (!weather || !weather.condition) return 1.0;
+        return TIMING_CONSTANTS.WEATHER_MULTIPLIERS[weather.condition] || 1.0;
+    }
+    
+    /**
+     * Get temporal speed multiplier
+     */
+    function getTemporalMultiplier(temporal) {
+        var hour = new Date().getHours();
+        var isWeekday = ![0, 6].includes(new Date().getDay());
+        
+        // Rush hour (weekday only)
+        if (isWeekday && ((hour >= 7 && hour <= 9) || (hour >= 16 && hour <= 18))) {
+            return TIMING_CONSTANTS.TEMPORAL_MULTIPLIERS.rush_hour;
+        }
+        
+        // Lunch hour (weekday only)
+        if (isWeekday && hour >= 11 && hour <= 13) {
+            return TIMING_CONSTANTS.TEMPORAL_MULTIPLIERS.lunch_hour;
+        }
+        
+        // Evening
+        if (hour >= 18 && hour <= 20) {
+            return TIMING_CONSTANTS.TEMPORAL_MULTIPLIERS.evening;
+        }
+        
+        // Night discount
+        if (hour >= 22 || hour <= 6) {
+            return TIMING_CONSTANTS.TEMPORAL_MULTIPLIERS.night;
+        }
+        
+        // Weekend discount
+        if (!isWeekday) {
+            return TIMING_CONSTANTS.TEMPORAL_MULTIPLIERS.weekend;
+        }
+        
+        return 1.0;
+    }
+    
+    /**
+     * Calculate approach time with weather/traffic adjustments (FALLBACK - haversine based)
+     */
+    function calculateApproachTimeFallback(driverPos, pickupPos, weather) {
+        // Calculate realistic route distance
+        var routeDistanceKm = calculateRouteDistance(
+            driverPos.lat, driverPos.lon,
+            pickupPos.lat, pickupPos.lon
+        );
+        
+        // Get weather multiplier
+        var weatherMult = getWeatherMultiplier(weather);
+        
+        // Calculate effective speed (reduced by weather)
+        var baseSpeed = TIMING_CONSTANTS.BASE_CITY_SPEED;
+        var effectiveSpeed = baseSpeed / weatherMult;
+        
+        // Calculate time in minutes
+        var approachMinutes = (routeDistanceKm / effectiveSpeed) * 60;
+        
+        // Apply minimum
+        return Math.max(TIMING_CONSTANTS.MIN_APPROACH_TIME, Math.ceil(approachMinutes));
+    }
+    
+    /**
+     * Calculate approach time - uses cache or fallback
+     * For synchronous calls, returns cached value or fallback estimate
+     */
+    function calculateApproachTime(driverPos, pickupPos, weather) {
+        // Check cache first (synchronous)
+        var driver = DATA.roster.find(function(d) {
+            var pos = getDriverPosition(d.id);
+            return pos && pos.lat === driverPos.lat && pos.lon === driverPos.lon;
+        });
+        
+        if (driver) {
+            var cached = getCachedETA(driver.id, pickupPos.lat, pickupPos.lon);
+            if (cached) {
+                return cached.eta;
+            }
+        }
+        
+        // Return fallback estimate
+        return calculateApproachTimeFallback(driverPos, pickupPos, weather);
+    }
+    
+    /**
+     * Get driver ETA using Google Directions API (ASYNC)
+     * Returns a Promise that resolves to ETA in minutes
+     * @param {Number} driverId - Driver ID
+     * @param {Object} destination - {lat, lon} destination coordinates
+     * @returns {Promise<{eta: Number, source: String, traffic: String}>}
+     */
+    function getDriverETAAsync(driverId, destination) {
+        return new Promise(function(resolve, reject) {
+            var driver = DATA.roster.find(function(d) { return d.id === driverId; });
+            if (!driver) {
+                return reject(new Error('Driver not found'));
+            }
+            
+            var position = getDriverPosition(driverId);
+            if (!position) {
+                return reject(new Error('Driver position unknown'));
+            }
+            
+            // Check cache first
+            var cached = getCachedETA(driverId, destination.lat, destination.lon);
+            if (cached) {
+                return resolve({
+                    eta: cached.eta,
+                    source: 'cache',
+                    traffic: 'cached'
+                });
+            }
+            
+            // Check if Google Maps API is available
+            if (!window.google || !window.google.maps || !window.google.maps.DirectionsService) {
+                console.warn('⚠️ Google Directions API not available, using fallback');
+                var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+                var fallbackETA = calculateApproachTimeFallback(position, destination, weather);
+                cacheETA(driverId, destination.lat, destination.lon, fallbackETA, 'fallback');
+                return resolve({
+                    eta: fallbackETA,
+                    source: 'fallback',
+                    traffic: 'estimated'
+                });
+            }
+            
+            // Create DirectionsService if needed
+            var directionsService = new google.maps.DirectionsService();
+            
+            var request = {
+                origin: new google.maps.LatLng(position.lat, position.lon),
+                destination: new google.maps.LatLng(destination.lat, destination.lon),
+                travelMode: google.maps.TravelMode.DRIVING,
+                drivingOptions: {
+                    departureTime: new Date(),
+                    trafficModel: google.maps.TrafficModel.BEST_GUESS
+                }
+            };
+            
+            console.log('🗺️ Requesting ETA for ' + driver.name + ': ' + position.name + ' → destination');
+            
+            // Set timeout
+            var timeoutId = setTimeout(function() {
+                console.warn('⚠️ Google Directions API timeout for ' + driver.name);
+                var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+                var fallbackETA = calculateApproachTimeFallback(position, destination, weather);
+                cacheETA(driverId, destination.lat, destination.lon, fallbackETA, 'timeout-fallback');
+                resolve({
+                    eta: fallbackETA,
+                    source: 'timeout-fallback',
+                    traffic: 'estimated'
+                });
+            }, TIMING_CONSTANTS.API_TIMEOUT);
+            
+            directionsService.route(request, function(result, status) {
+                clearTimeout(timeoutId);
+                
+                if (status === google.maps.DirectionsStatus.OK) {
+                    var leg = result.routes[0].legs[0];
+                    
+                    // Use duration_in_traffic if available, otherwise regular duration
+                    var durationSeconds = leg.duration_in_traffic 
+                        ? leg.duration_in_traffic.value 
+                        : leg.duration.value;
+                    
+                    var etaMinutes = Math.ceil(durationSeconds / 60);
+                    var trafficCondition = 'normal';
+                    
+                    // Compare traffic vs baseline
+                    if (leg.duration_in_traffic && leg.duration) {
+                        var ratio = leg.duration_in_traffic.value / leg.duration.value;
+                        if (ratio > 1.3) trafficCondition = 'heavy';
+                        else if (ratio > 1.15) trafficCondition = 'moderate';
+                        else if (ratio < 0.95) trafficCondition = 'light';
+                    }
+                    
+                    // Apply minimum
+                    etaMinutes = Math.max(TIMING_CONSTANTS.MIN_APPROACH_TIME, etaMinutes);
+                    
+                    console.log('✅ Google ETA for ' + driver.name + ': ' + etaMinutes + ' min (traffic: ' + trafficCondition + ')');
+                    
+                    // Cache the result
+                    cacheETA(driverId, destination.lat, destination.lon, etaMinutes, 'google-api');
+                    
+                    resolve({
+                        eta: etaMinutes,
+                        source: 'google-api',
+                        traffic: trafficCondition,
+                        distanceMeters: leg.distance.value,
+                        distanceText: leg.distance.text
+                    });
+                } else {
+                    console.warn('⚠️ Google Directions failed for ' + driver.name + ': ' + status);
+                    var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+                    var fallbackETA = calculateApproachTimeFallback(position, destination, weather);
+                    cacheETA(driverId, destination.lat, destination.lon, fallbackETA, 'api-error-fallback');
+                    resolve({
+                        eta: fallbackETA,
+                        source: 'api-error-fallback',
+                        traffic: 'estimated'
+                    });
+                }
+            });
+        });
+    }
+    
+    /**
+     * Batch fetch ETAs for all available drivers to a destination
+     * Returns Promise that resolves to array of driver ETAs
+     * @param {Object} destination - {lat, lon}
+     * @returns {Promise<Array<{driverId, driverName, eta, source, traffic}>>}
+     */
+    function getAllDriverETAs(destination) {
+        var availableDrivers = DATA.roster.filter(function(d) {
+            return DATA.shift.indexOf(d.id) !== -1;
+        });
+        
+        if (availableDrivers.length === 0) {
+            return Promise.resolve([]);
+        }
+        
+        console.log('🚕 Fetching ETAs for ' + availableDrivers.length + ' drivers...');
+        
+        var promises = availableDrivers.map(function(driver) {
+            return getDriverETAAsync(driver.id, destination)
+                .then(function(result) {
+                    return {
+                        driverId: driver.id,
+                        driverName: driver.name,
+                        driverCall: driver.call,
+                        eta: result.eta,
+                        source: result.source,
+                        traffic: result.traffic,
+                        distanceText: result.distanceText || null
+                    };
+                })
+                .catch(function(err) {
+                    console.warn('⚠️ ETA fetch failed for ' + driver.name + ':', err.message);
+                    return {
+                        driverId: driver.id,
+                        driverName: driver.name,
+                        driverCall: driver.call,
+                        eta: 10, // Default fallback
+                        source: 'error',
+                        traffic: 'unknown'
+                    };
+                });
+        });
+        
+        return Promise.all(promises).then(function(results) {
+            // Sort by ETA
+            results.sort(function(a, b) { return a.eta - b.eta; });
+            console.log('✅ All driver ETAs fetched:', results.map(function(r) { 
+                return r.driverName + ':' + r.eta + 'm'; 
+            }).join(', '));
+            return results;
+        });
+    }
+    
+    /**
+     * Get driver's current position
+     */
+    function getDriverPosition(driverId) {
+        var driver = DATA.roster.find(function(d) { return d.id === driverId; });
+        if (!driver) return null;
+        
+        if (driver.currentLocation) {
+            return {
+                lat: driver.currentLocation.lat,
+                lon: driver.currentLocation.lon,
+                source: 'manual',
+                name: driver.currentLocation.name
+            };
+        }
+        
+        if (driver.lastDrop) {
+            return {
+                lat: driver.lastDrop.lat,
+                lon: driver.lastDrop.lon,
+                source: 'lastDrop',
+                name: driver.lastDrop.name
+            };
+        }
+        
+        return {
+            lat: CONFIG.LOCALS[0].lat,
+            lon: CONFIG.LOCALS[0].lon,
+            source: 'default',
+            name: CONFIG.LOCALS[0].n
+        };
+    }
+    
+    /**
+     * Format duration in minutes to readable string
+     */
+    function formatDuration(minutes) {
+        if (minutes >= 60) {
+            var hours = Math.floor(minutes / 60);
+            var mins = minutes % 60;
+            return hours + 'h ' + mins + 'm';
+        }
+        return minutes + ' min';
+    }
+
+    // ========================================================================
+    // DRIVER AVAILABILITY ANALYSIS
+    // ========================================================================
+    
+    /**
+     * Analyze driver availability for ETA calculations
+     */
+    function analyzeDriverAvailability(clockedInDrivers) {
+        var now = Date.now();
+        
+        var analysis = clockedInDrivers.map(function(driver) {
+            var onBreak = DATA.breaks.find(function(b) { return b.driverId === driver.id && b.active; });
+            
+            if (onBreak) {
+                return {
+                    driver: driver,
+                    status: 'break',
+                    availableNow: false,
+                    availableInMins: 30,
+                    position: null,
+                    distanceToCenter: null,
+                    activeTrip: null,
+                    stackedCount: 0,
+                    totalCommittedMins: 30
+                };
+            }
+            
+            var trips = getDriverTrips(driver.id);
+            var activeTrip = trips.find(function(t) { return t.status === 'active'; });
+            var stackedTrips = trips.filter(function(t) { return t.status === 'stacked'; });
+            
+            var position = getDriverPosition(driver.id);
+            var distanceToCenter = null;
+            
+            if (position) {
+                distanceToCenter = haversineDistance(
+                    position.lat, position.lon,
+                    CONFIG.LOCALS[0].lat, CONFIG.LOCALS[0].lon
+                );
+            }
+            
+            var totalCommittedMins = 0;
+            var availableAt = now;
+            
+            if (activeTrip) {
+                var activeRemaining = Math.max(0, (activeTrip.end - now) / 60000);
+                totalCommittedMins += activeRemaining;
+                availableAt = activeTrip.end;
+            }
+            
+            stackedTrips.forEach(function(stacked) {
+                var stackedDuration = (stacked.approach || 5) + stacked.mins + (stacked.buffer || 0);
+                totalCommittedMins += stackedDuration;
+                availableAt += stackedDuration * 60000;
+            });
+            
+            var availableInMins = Math.max(0, (availableAt - now) / 60000);
+            
+            return {
+                driver: driver,
+                status: activeTrip ? 'busy' : (stackedTrips.length > 0 ? 'stacked-only' : 'available'),
+                availableNow: !activeTrip && stackedTrips.length === 0,
+                availableInMins: Math.ceil(availableInMins),
+                position: position,
+                distanceToCenter: distanceToCenter ? Math.round(distanceToCenter * 10) / 10 : null,
+                activeTrip: activeTrip ? {
+                    tripName: activeTrip.tripName,
+                    phase: activeTrip.phase,
+                    remainingMins: Math.ceil(Math.max(0, (activeTrip.end - now) / 60000))
+                } : null,
+                stackedCount: stackedTrips.length,
+                totalCommittedMins: Math.ceil(totalCommittedMins)
+            };
+        });
+        
+        analysis.sort(function(a, b) {
+            if (a.availableNow && !b.availableNow) return -1;
+            if (!a.availableNow && b.availableNow) return 1;
+            return a.availableInMins - b.availableInMins;
+        });
+        
+        return {
+            drivers: analysis,
+            availableCount: analysis.filter(function(d) { return d.availableNow; }).length,
+            busyCount: analysis.filter(function(d) { return d.status === 'busy'; }).length,
+            onBreakCount: analysis.filter(function(d) { return d.status === 'break'; }).length,
+            totalStackedTrips: analysis.reduce(function(sum, d) { return sum + d.stackedCount; }, 0),
+            queuedCalls: DATA.queue.length,
+            asapQueueCount: DATA.queue.filter(function(j) { return !j.prebook; }).length,
+            soonestDriver: analysis[0] || null
+        };
+    }
+    
+    /**
+     * Calculate pickup quote for specific location (SYNC - uses cache/fallback)
+     */
+    function calculatePickupQuote(pickupCoords) {
+        var pickupLon = pickupCoords[0];
+        var pickupLat = pickupCoords[1];
+        var pickupPos = { lat: pickupLat, lon: pickupLon };
+        
+        // Get clocked-in drivers
+        var availableDrivers = DATA.roster.filter(function(d) {
+            return DATA.shift.indexOf(d.id) !== -1;
+        });
+        
+        if (availableDrivers.length === 0) {
+            return {
+                quotedMinutes: 10,
+                baseAverage: 10,
+                safetyMargin: 2,
+                weather: null,
+                drivers: [],
+                source: 'no-drivers'
+            };
+        }
+        
+        // Get current weather
+        var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+        
+        // Calculate ETA for each driver using sync approach calculation
+        var driverETAs = availableDrivers.map(function(driver) {
+            var position = getDriverPosition(driver.id);
+            var eta = calculateApproachTime(position, pickupPos, weather);
+            
+            return {
+                id: driver.id,
+                name: driver.name,
+                call: driver.call,
+                eta: eta,
+                source: 'sync'
+            };
+        });
+        
+        // Sort by ETA
+        driverETAs.sort(function(a, b) { return a.eta - b.eta; });
+        
+        // Get top 2 drivers
+        var top2 = driverETAs.slice(0, 2);
+        var baseAverage = top2.reduce(function(sum, d) { return sum + d.eta; }, 0) / top2.length;
+        
+        // Apply temporal multiplier
+        var temporalMult = getTemporalMultiplier();
+        var adjustedAverage = baseAverage * temporalMult;
+        
+        // Calculate safety margin based on conditions
+        var weatherMult = getWeatherMultiplier(weather);
+        var combinedMult = Math.min(weatherMult * temporalMult, TIMING_CONSTANTS.MAX_COMBINED_MULTIPLIER);
+        var safetyMargin = combinedMult > 1.3 ? 3 : 2;
+        
+        var quotedMinutes = Math.ceil(adjustedAverage + safetyMargin);
+        
+        return {
+            quotedMinutes: quotedMinutes,
+            baseAverage: baseAverage,
+            safetyMargin: safetyMargin,
+            weather: weather ? weather.condition : null,
+            drivers: top2,
+            source: 'sync'
+        };
+    }
+    
+    /**
+     * Calculate pickup quote using Google Directions API (ASYNC)
+     * Returns Promise with accurate traffic-aware ETAs
+     */
+    function calculatePickupQuoteAsync(pickupCoords) {
+        var pickupLon = pickupCoords[0];
+        var pickupLat = pickupCoords[1];
+        var destination = { lat: pickupLat, lon: pickupLon };
+        
+        // Get clocked-in drivers
+        var availableDrivers = DATA.roster.filter(function(d) {
+            return DATA.shift.indexOf(d.id) !== -1;
+        });
+        
+        if (availableDrivers.length === 0) {
+            return Promise.resolve({
+                quotedMinutes: 10,
+                baseAverage: 10,
+                safetyMargin: 2,
+                weather: null,
+                drivers: [],
+                source: 'no-drivers'
+            });
+        }
+        
+        // Get current weather
+        var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+        
+        // Fetch all driver ETAs via Google API
+        return getAllDriverETAs(destination).then(function(etaResults) {
+            // Map results to driver format
+            var driverETAs = etaResults.map(function(r) {
+                return {
+                    id: r.driverId,
+                    name: r.driverName,
+                    call: r.driverCall,
+                    eta: r.eta,
+                    source: r.source,
+                    traffic: r.traffic,
+                    distance: r.distanceText
+                };
+            });
+            
+            // Already sorted by ETA from getAllDriverETAs
+            var top2 = driverETAs.slice(0, 2);
+            var baseAverage = top2.reduce(function(sum, d) { return sum + d.eta; }, 0) / top2.length;
+            
+            // Apply temporal multiplier (less aggressive since API includes traffic)
+            var temporalMult = getTemporalMultiplier();
+            // Reduce temporal impact since API already has traffic data
+            var adjustedMult = 1 + ((temporalMult - 1) * 0.5);
+            var adjustedAverage = baseAverage * adjustedMult;
+            
+            // Calculate safety margin
+            var weatherMult = getWeatherMultiplier(weather);
+            var combinedMult = Math.min(weatherMult * adjustedMult, TIMING_CONSTANTS.MAX_COMBINED_MULTIPLIER);
+            var safetyMargin = combinedMult > 1.2 ? 2 : 1; // Smaller margin with real traffic data
+            
+            var quotedMinutes = Math.ceil(adjustedAverage + safetyMargin);
+            
+            // Log the improvement
+            var syncQuote = calculatePickupQuote(pickupCoords);
+            if (Math.abs(quotedMinutes - syncQuote.quotedMinutes) > 2) {
+                console.log('📊 Quote comparison: Sync=' + syncQuote.quotedMinutes + 'm, API=' + quotedMinutes + 'm (Δ' + (quotedMinutes - syncQuote.quotedMinutes) + 'm)');
+            }
+            
+            return {
+                quotedMinutes: quotedMinutes,
+                baseAverage: baseAverage,
+                safetyMargin: safetyMargin,
+                weather: weather ? weather.condition : null,
+                drivers: top2,
+                source: 'google-api',
+                allDrivers: driverETAs
+            };
+        }).catch(function(err) {
+            console.warn('⚠️ Async quote failed, using sync:', err.message);
+            return calculatePickupQuote(pickupCoords);
+        });
+    }
+
+    // ========================================================================
+    // GLOBAL ETA SYSTEM
+    // ========================================================================
+    
+    /**
+     * Calculate deterministic ETA with corrected formula
+     */
+    function calculateDeterministicETA(analysis) {
+        var drivers = analysis.drivers;
+        var availableCount = analysis.availableCount;
+        var asapQueueCount = analysis.asapQueueCount;
+        var soonestDriver = analysis.soonestDriver;
+        
+        var eta = 0;
+        var reasoning = '';
+        var nearestDriver = null;
+        var theirStatus = '';
+        
+        // Get current conditions
+        var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+        var weatherMult = getWeatherMultiplier(weather);
+        var temporalMult = getTemporalMultiplier();
+        
+        if (availableCount > 0) {
+            var availableDrivers = drivers.filter(function(d) { return d.availableNow; });
+            
+            // Sort by distance to city center
+            availableDrivers.sort(function(a, b) {
+                var distA = a.distanceToCenter !== null ? a.distanceToCenter : 10;
+                var distB = b.distanceToCenter !== null ? b.distanceToCenter : 10;
+                return distA - distB;
+            });
+            
+            var nearest = availableDrivers[0];
+            nearestDriver = nearest.driver.name;
+            theirStatus = 'Available now';
+            
+            if (nearest.distanceToCenter !== null) {
+                // Use corrected approach calculation
+                var straightLineKm = nearest.distanceToCenter;
+                var routeKm = straightLineKm * TIMING_CONSTANTS.URBAN_ROUTE_FACTOR;
+                var effectiveSpeed = TIMING_CONSTANTS.BASE_CITY_SPEED / weatherMult;
+                var approachMins = Math.ceil((routeKm / effectiveSpeed) * 60);
+                
+                eta = Math.max(TIMING_CONSTANTS.MIN_APPROACH_TIME, approachMins);
+                reasoning = nearest.driver.name + ' available, ' + nearest.distanceToCenter + ' km from center';
+            } else {
+                eta = TIMING_CONSTANTS.MIN_APPROACH_TIME;
+                reasoning = nearest.driver.name + ' available (position unknown)';
+            }
+            
+            eta += TIMING_CONSTANTS.DISPATCH_OVERHEAD;
+            
+            // Queue wait time
+            if (asapQueueCount > 0 && asapQueueCount >= availableCount) {
+                var callsAhead = Math.ceil(asapQueueCount / availableCount);
+                var queueWait = (callsAhead - 1) * TIMING_CONSTANTS.AVG_TRIP_DURATION;
+                eta += queueWait;
+                reasoning += ' | ' + asapQueueCount + ' in queue (+' + queueWait + ' min)';
+            }
+            
+        } else {
+            if (soonestDriver) {
+                nearestDriver = soonestDriver.driver.name;
+                theirStatus = 'Available in ' + soonestDriver.availableInMins + ' min';
+                
+                var approachAfterFree = 3;
+                eta = soonestDriver.availableInMins + approachAfterFree;
+                reasoning = soonestDriver.driver.name + ' finishes in ' + soonestDriver.availableInMins + ' min';
+                
+                if (asapQueueCount > 0) {
+                    var queueWait = Math.ceil(asapQueueCount * TIMING_CONSTANTS.AVG_TRIP_DURATION / drivers.length);
+                    eta += queueWait;
+                    reasoning += ' | ' + asapQueueCount + ' ahead (+' + queueWait + ' min)';
+                }
+            } else {
+                eta = 15;
+                reasoning = 'No driver data';
+                nearestDriver = 'Unknown';
+                theirStatus = 'Unknown';
+            }
+        }
+        
+        // Apply temporal multiplier and cap
+        var combinedMult = Math.min(weatherMult * temporalMult, TIMING_CONSTANTS.MAX_COMBINED_MULTIPLIER);
+        eta = eta * combinedMult;
+        
+        // Add safety margin for difficult conditions
+        if (combinedMult > 1.3) {
+            eta += 2;
+            reasoning += ' | +2 min safety (difficult conditions)';
+        }
+        
+        eta = Math.max(2, Math.min(60, Math.ceil(eta)));
+        
+        return {
+            eta: eta,
+            reasoning: reasoning,
+            confidence: availableCount > 0 ? 'high' : 'medium',
+            source: 'deterministic',
+            breakdown: {
+                nearestDriver: nearestDriver,
+                theirStatus: theirStatus,
+                availableDrivers: availableCount,
+                queuedASAP: asapQueueCount,
+                weatherCondition: weather ? weather.condition : 'unknown',
+                multiplier: combinedMult.toFixed(2)
+            }
+        };
+    }
+    
+    /**
+     * Calculate global taxi ETA
+     */
+    function calculateGlobalTaxiETA() {
+        console.log('🚕 [Global ETA] Starting calculation...');
+        
+        var clockedInDrivers = DATA.roster.filter(function(d) {
+            return DATA.shift.indexOf(d.id) !== -1;
+        });
+        
+        console.log('🚕 [Global ETA] Clocked in drivers:', clockedInDrivers.length);
+        
+        if (clockedInDrivers.length === 0) {
+            console.log('🚕 [Global ETA] No drivers clocked in - returning null');
+            return Promise.resolve({
+                eta: null,
+                message: 'No drivers available',
+                source: 'none',
+                confidence: 'none',
+                reasoning: 'No drivers clocked in'
+            });
+        }
+        
+        try {
+            var driverAnalysis = analyzeDriverAvailability(clockedInDrivers);
+            console.log('🚕 [Global ETA] Driver analysis complete:', {
+                availableCount: driverAnalysis.availableCount,
+                busyCount: driverAnalysis.busyCount,
+                queuedCalls: driverAnalysis.queuedCalls
+            });
+            
+            var baseETA = calculateDeterministicETA(driverAnalysis);
+            console.log('🚕 [Global ETA] Final ETA:', baseETA.eta + ' min (' + baseETA.confidence + ')');
+            
+            return Promise.resolve(baseETA);
+        } catch (error) {
+            console.error('🚕 [Global ETA] Error calculating ETA:', error);
+            return Promise.resolve({
+                eta: 10,
+                message: 'Error calculating ETA',
+                source: 'fallback',
+                confidence: 'low',
+                reasoning: 'Error: ' + error.message
+            });
+        }
+    }
+    
+    /**
+     * Update global ETA display
+     */
+    function updateGlobalETA() {
+        calculateGlobalTaxiETA().then(function(result) {
+            console.log('🚕 [Update Display] Received ETA result:', result);
+            
+            var etaEl = document.getElementById('global-eta');
+            var containerEl = document.getElementById('global-eta-container');
+            
+            console.log('🚕 [Update Display] Elements found:', { 
+                etaEl: !!etaEl, 
+                containerEl: !!containerEl 
+            });
+            
+            if (!etaEl || !containerEl) {
+                console.error('🚕 [Update Display] ERROR: Elements not found!');
+                return;
+            }
+            
+            if (result.eta === null) {
+                etaEl.textContent = '--';
+                containerEl.style.background = 'rgba(149, 165, 166, 0.2)';
+                containerEl.style.borderColor = 'rgba(149, 165, 166, 0.4)';
+                containerEl.title = 'No drivers clocked in';
+            } else {
+                if (result.eta >= 60) {
+                    var hours = Math.floor(result.eta / 60);
+                    var mins = result.eta % 60;
+                    etaEl.textContent = hours + 'h ' + mins + 'm';
+                } else {
+                    etaEl.textContent = result.eta + ' min';
+                }
+                
+                if (result.eta <= 5) {
+                    containerEl.style.background = 'rgba(39, 174, 96, 0.25)';
+                    containerEl.style.borderColor = 'rgba(39, 174, 96, 0.5)';
+                } else if (result.eta <= 10) {
+                    containerEl.style.background = 'rgba(46, 204, 113, 0.25)';
+                    containerEl.style.borderColor = 'rgba(46, 204, 113, 0.5)';
+                } else if (result.eta <= 15) {
+                    containerEl.style.background = 'rgba(241, 196, 15, 0.25)';
+                    containerEl.style.borderColor = 'rgba(241, 196, 15, 0.5)';
+                } else if (result.eta <= 20) {
+                    containerEl.style.background = 'rgba(230, 126, 34, 0.25)';
+                    containerEl.style.borderColor = 'rgba(230, 126, 34, 0.5)';
+                } else {
+                    containerEl.style.background = 'rgba(231, 76, 60, 0.25)';
+                    containerEl.style.borderColor = 'rgba(231, 76, 60, 0.5)';
+                }
+                
+                var b = result.breakdown || {};
+                var tooltipLines = [
+                    'ETA: ' + result.eta + ' min (' + (result.source || 'calculated') + ')',
+                    'Nearest: ' + (b.nearestDriver || 'N/A') + ' - ' + (b.theirStatus || 'N/A'),
+                    'Available: ' + (b.availableDrivers || 0) + ' drivers',
+                    'Queue: ' + (b.queuedASAP || 0) + ' ASAP calls',
+                    'Confidence: ' + (result.confidence || 'N/A'),
+                    '',
+                    result.reasoning || ''
+                ];
+                
+                containerEl.title = tooltipLines.join('\n');
+            }
+        });
+    }
+
+    // ========================================================================
+    // LLM TIMING SERVICE
+    // ========================================================================
+    
+    var LLMTimingService = {
+        endpoint: 'http://localhost:11435/api/generate',
+        model: 'qwen3-coder:30b',
+        enabled: true,
+        
+        getTaxiETA: function(pickupCoords, dropoffCoords, tripMins, customerPhone, prebookTime) {
+            var self = this;
+            
+            // If prebooked, calculate minutes until pickup time
+            var prebookInfo = null;
+            if (prebookTime) {
+                var now = Date.now();
+                var prebookMs = new Date(prebookTime).getTime();
+                var minsUntilPrebook = Math.round((prebookMs - now) / 60000);
+                if (minsUntilPrebook > 5) {
+                    prebookInfo = {
+                        scheduledTime: prebookTime,
+                        minsUntilPickup: minsUntilPrebook,
+                        isPrebooked: true
+                    };
+                }
+            }
+            
+            if (!this.enabled) {
+                return Promise.resolve(this.fallbackETA(pickupCoords, prebookInfo));
+            }
+            
+            return ContextBuilder.build('taxiETA', {
+                pickup: { lat: pickupCoords[1], lon: pickupCoords[0] },
+                dropoff: { lat: dropoffCoords[1], lon: dropoffCoords[0] },
+                tripDuration: tripMins,
+                customerPhone: customerPhone,
+                prebook: prebookInfo
+            }).then(function(context) {
+                var prompt = self.buildTaxiETAPrompt(context, prebookInfo);
+                
+                return fetch(self.endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: self.model,
+                        prompt: prompt,
+                        stream: false,
+                        format: 'json',
+                        options: { temperature: 0.1, num_predict: 800 }
+                    })
+                });
+            }).then(function(response) {
+                if (!response.ok) throw new Error('Ollama request failed');
+                return response.json();
+            }).then(function(data) {
+                var result = JSON.parse(data.response);
+                
+                if (typeof result.quotedMinutes !== 'number') {
+                    throw new Error('Invalid response structure');
+                }
+                
+                return result;
+            }).catch(function(err) {
+                console.warn('LLM ETA failed, using fallback:', err.message);
+                return self.fallbackETA(pickupCoords);
+            });
+        },
+        
+        recalculateETA: function(tripId) {
+            var self = this;
+            var trip = DATA.live.find(function(t) { return t.id === tripId; });
+            if (!trip) return Promise.resolve(null);
+            
+            if (!this.enabled) {
+                return Promise.resolve(this.fallbackRecalculate(trip));
+            }
+            
+            return ContextBuilder.build('recalculateETA', {
+                tripId: tripId,
+                phase: trip.phase,
+                originalETA: trip.mins,
+                elapsed: Math.floor((Date.now() - trip.start) / 60000),
+                buffer: trip.buffer,
+                driverName: trip.dr.name
+            }).then(function(context) {
+                var prompt = self.buildRecalculatePrompt(context);
+                
+                return fetch(self.endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: self.model,
+                        prompt: prompt,
+                        stream: false,
+                        format: 'json',
+                        options: { temperature: 0.1, num_predict: 600 }
+                    })
+                });
+            }).then(function(response) {
+                if (!response.ok) throw new Error('Ollama request failed');
+                return response.json();
+            }).then(function(data) {
+                return JSON.parse(data.response);
+            }).catch(function(err) {
+                console.warn('LLM recalculate failed:', err.message);
+                return self.fallbackRecalculate(trip);
+            });
+        },
+        
+        buildTaxiETAPrompt: function(context, prebookInfo) {
+            var driversStr = context.drivers.map(function(d) {
+                return '- ' + d.name + ': ' + d.status + (d.availableIn > 0 ? ' (available in ' + d.availableIn + ' min)' : '') + ', ' + d.stackedTrips + ' stacked';
+            }).join('\n');
+            
+            // Build prebook section if applicable
+            var prebookSection = '';
+            if (prebookInfo && prebookInfo.isPrebooked) {
+                prebookSection = '\n** PREBOOKED CALL **\n' +
+                    '- Scheduled pickup time: ' + prebookInfo.scheduledTime + '\n' +
+                    '- Minutes until scheduled pickup: ' + prebookInfo.minsUntilPickup + '\n' +
+                    '- NOTE: This is NOT an ASAP call. The customer expects pickup at the scheduled time.\n' +
+                    '  Do NOT calculate based on current driver availability.\n' +
+                    '  The quotedMinutes should reflect the SCHEDULED time, not immediate dispatch.\n\n';
+            }
+            
+            return 'You are a taxi dispatch timing analyst. Calculate an accurate customer pickup ETA.\n\n' +
+                prebookSection +
+                'CONTEXT:\n' +
+                '- Current time: ' + context.localTime + ' on ' + context.dayOfWeek + '\n' +
+                '- Weather: ' + context.weather.condition + ', ' + context.weather.temperature + '°C, roads ' + context.weather.roadCondition + '\n' +
+                '- Traffic: ' + context.traffic.generalCondition + ' (' + context.traffic.delayFactor.toFixed(2) + 'x normal)\n' +
+                '- Queue length: ' + context.queueLength + ' pending trips\n' +
+                '- Active trips: ' + context.activeTrips + '\n\n' +
+                'DRIVERS:\n' + driversStr + '\n\n' +
+                'REQUEST:\n' +
+                '- Pickup location: ' + context.requestParams.pickup.lat.toFixed(4) + ', ' + context.requestParams.pickup.lon.toFixed(4) + '\n' +
+                '- Trip duration once picked up: ' + context.requestParams.tripDuration + ' minutes\n' +
+                (prebookInfo && prebookInfo.isPrebooked ? '- PREBOOKED for: ' + prebookInfo.scheduledTime + ' (' + prebookInfo.minsUntilPickup + ' min from now)\n' : '') + '\n' +
+                'Return ONLY valid JSON:\n' +
+                '{\n' +
+                '    "quotedMinutes": <number>,\n' +
+                '    "confidence": "high" | "medium" | "low",\n' +
+                '    "reasoning": "<one sentence explanation>",\n' +
+                (prebookInfo && prebookInfo.isPrebooked ? '    "isPrebooked": true,\n    "scheduledPickup": "' + prebookInfo.scheduledTime + '",\n' : '') +
+                '    "breakdown": {\n' +
+                '        "driverApproach": <number>,\n' +
+                '        "trafficBuffer": <number>,\n' +
+                '        "weatherBuffer": <number>,\n' +
+                '        "safetyMargin": <number>\n' +
+                '    },\n' +
+                '    "suggestedDriver": "<driver name>" | null,\n' +
+                '    "alternateDriver": "<driver name>" | null\n' +
+                '}';
+        },
+        
+        buildRecalculatePrompt: function(context) {
+            return 'You are recalculating ETA for an active taxi trip.\n\n' +
+                'TRIP STATUS:\n' +
+                '- Current phase: ' + context.requestParams.phase + '\n' +
+                '- Original ETA: ' + context.requestParams.originalETA + ' minutes\n' +
+                '- Elapsed time: ' + context.requestParams.elapsed + ' minutes\n' +
+                '- Current buffer: ' + context.requestParams.buffer + ' minutes\n' +
+                '- Driver: ' + context.requestParams.driverName + '\n\n' +
+                'CONTEXT:\n' +
+                '- Current time: ' + context.localTime + '\n' +
+                '- Weather: ' + context.weather.condition + ', roads ' + context.weather.roadCondition + '\n' +
+                '- Traffic: ' + context.traffic.generalCondition + ' (' + context.traffic.delayFactor.toFixed(2) + 'x)\n\n' +
+                'Return ONLY valid JSON:\n' +
+                '{\n' +
+                '    "updatedMinutes": <number>,\n' +
+                '    "changeFromOriginal": <number>,\n' +
+                '    "reason": "<brief explanation>",\n' +
+                '    "customerMessage": "<what to tell customer>",\n' +
+                '    "confidence": "high" | "medium" | "low"\n' +
+                '}';
+        },
+        
+        fallbackETA: function(pickupCoords, prebookInfo) {
+            // If prebooked, return the scheduled time info instead of calculating ETA
+            if (prebookInfo && prebookInfo.isPrebooked) {
+                return {
+                    quotedMinutes: prebookInfo.minsUntilPickup,
+                    confidence: 'high',
+                    reasoning: 'Prebooked call scheduled for ' + prebookInfo.scheduledTime,
+                    isPrebooked: true,
+                    scheduledPickup: prebookInfo.scheduledTime,
+                    breakdown: {
+                        driverApproach: 0,
+                        weatherBuffer: 0,
+                        temporalBuffer: 0,
+                        safetyMargin: 0
+                    },
+                    suggestedDriver: null,
+                    alternateDriver: null,
+                    llmFallback: true
+                };
+            }
+            
+            var quote = calculatePickupQuote(pickupCoords);
+            
+            // Calculate weather and temporal buffers
+            var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+            var weatherMult = getWeatherMultiplier(weather);
+            var temporalMult = getTemporalMultiplier();
+            var weatherBuffer = Math.ceil((weatherMult - 1.0) * quote.baseAverage);
+            var temporalBuffer = Math.ceil((temporalMult - 1.0) * quote.baseAverage);
+            
+            return {
+                quotedMinutes: quote.quotedMinutes,
+                confidence: 'medium',
+                reasoning: 'Using deterministic calculation with weather/temporal adjustments',
+                breakdown: {
+                    driverApproach: quote.baseAverage,
+                    weatherBuffer: weatherBuffer,
+                    temporalBuffer: temporalBuffer,
+                    safetyMargin: quote.safetyMargin
+                },
+                suggestedDriver: quote.drivers[0] ? quote.drivers[0].name : null,
+                alternateDriver: quote.drivers[1] ? quote.drivers[1].name : null,
+                llmFallback: true
+            };
+        },
+        
+        fallbackRecalculate: function(trip) {
+            var remaining = Math.max(0, Math.ceil((trip.phaseEnd - Date.now()) / 60000));
+            
+            return {
+                updatedMinutes: remaining,
+                changeFromOriginal: remaining - trip.mins,
+                reason: 'Calculated from current progress',
+                customerMessage: 'Your taxi will arrive in approximately ' + remaining + ' minutes.',
+                confidence: 'low',
+                llmFallback: true
+            };
+        }
+    };
+
+    // ========================================================================
+    // TRIP PHASE TIMING
+    // ========================================================================
+    
+    /**
+     * Recalculate remaining route after waypoint
+     */
+    function recalculateRemainingRoute(trip) {
+        var totalLegs = (trip.waypoints ? trip.waypoints.length : 0) + 1;
+        var remainingLegs = totalLegs - (trip.currentWaypointIndex + 1);
+        
+        if (remainingLegs <= 0) {
+            var legDuration = Math.ceil(trip.mins / totalLegs);
+            trip.phaseStart = Date.now();
+            trip.phaseEnd = trip.phaseStart + (legDuration * 60000);
+            return;
+        }
+        
+        var legDuration = Math.ceil(trip.mins / totalLegs);
+        trip.phaseStart = Date.now();
+        trip.phaseEnd = trip.phaseStart + (legDuration * 60000);
+        
+        console.log('✅ Route recalculated: ' + remainingLegs + ' legs remaining, ' + legDuration + ' min per leg');
+    }
+    
+    /**
+     * Adjust buffer time for active trip
+     */
+    function adjustBuffer(tripId, delta) {
+        var trip = DATA.live.find(function(t) { return t.id === tripId; });
+        if (!trip) return;
+        
+        var oldBuffer = trip.buffer || 0;
+        trip.buffer = Math.max(0, Math.min(60, oldBuffer + delta));
+        
+        var deltaMs = delta * 60000;
+        trip.end += deltaMs;
+        trip.phaseEnd += deltaMs;
+        trip.approachEnd += deltaMs;
+        
+        save();
+        renderDriverCards();
+        
+        console.log('✅ Buffer adjusted: ' + oldBuffer + ' → ' + trip.buffer + ' min');
+    }
+
+    // ========================================================================
+    // DRIVER SUGGESTION SYSTEM
+    // ========================================================================
+    
+    /**
+     * Get suggested driver for a job using FRESH calculations (SYNC - uses cache/fallback)
+     * For immediate UI response - uses cached ETAs or haversine fallback
+     */
+    function getSuggestedDrivers(job) {
+        console.log('🎯 [DEBUG] getSuggestedDrivers called for job', job.id);
+        
+        try {
+            var result = calculateBestDriverSync(job);
+            console.log('✅ [DEBUG] calculateBestDriverSync returned:', result);
+            return result;
+        } catch (error) {
+            console.error('❌ [DEBUG] getSuggestedDrivers ERROR:', error);
+            return {
+                primary: null,
+                alternate: null,
+                reasoning: 'Error: ' + error.message,
+                confidence: 'none',
+                source: 'error'
+            };
+        }
+    }
+    
+    /**
+     * Get suggested driver for a job using Google Directions API (ASYNC)
+     * Returns Promise - use when you can wait for accurate ETAs
+     */
+    function getSuggestedDriversAsync(job) {
+        console.log('🎯 [ASYNC] getSuggestedDriversAsync called for job', job.id);
+        
+        return calculateBestDriverAsync(job)
+            .then(function(result) {
+                console.log('✅ [ASYNC] calculateBestDriverAsync returned:', result);
+                return result;
+            })
+            .catch(function(error) {
+                console.error('❌ [ASYNC] getSuggestedDriversAsync ERROR:', error);
+                // Fallback to sync version
+                return getSuggestedDrivers(job);
+            });
+    }
+    
+    /**
+     * SYNC driver selection - uses cached ETAs or haversine fallback
+     * Fast, for immediate UI updates
+     */
+    function calculateBestDriverSync(job) {
+        var pickupLat = job.s[1];
+        var pickupLon = job.s[0];
+        var pickupPos = {lat: pickupLat, lon: pickupLon};
+        
+        // Get eligible drivers
+        var eligibleDrivers = getEligibleDrivers();
+        
+        if (eligibleDrivers.length === 0) {
+            console.warn('⚠️ No eligible drivers available');
+            return {
+                primary: null,
+                alternate: null,
+                reasoning: 'No available drivers',
+                confidence: 'none',
+                source: 'none'
+            };
+        }
+        
+        var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+        
+        // Score each driver using sync approach time (cache or fallback)
+        var scored = eligibleDrivers.map(function(driver) {
+            return scoreDriver(driver, pickupPos, weather, 'sync');
+        });
+        
+        return buildSuggestionResult(scored, 'sync');
+    }
+    
+    /**
+     * ASYNC driver selection - uses Google Directions API for real ETAs
+     * Accurate, for assignment decisions
+     */
+    function calculateBestDriverAsync(job) {
+        var pickupLat = job.s[1];
+        var pickupLon = job.s[0];
+        var destination = {lat: pickupLat, lon: pickupLon};
+        
+        // Get eligible drivers
+        var eligibleDrivers = getEligibleDrivers();
+        
+        if (eligibleDrivers.length === 0) {
+            console.warn('⚠️ No eligible drivers available');
+            return Promise.resolve({
+                primary: null,
+                alternate: null,
+                reasoning: 'No available drivers',
+                confidence: 'none',
+                source: 'none'
+            });
+        }
+        
+        // Fetch all driver ETAs via Google API
+        return getAllDriverETAs(destination).then(function(etaResults) {
+            var weather = WeatherService ? WeatherService.getCurrentConditions() : null;
+            
+            // Score each driver using real API ETAs
+            var scored = eligibleDrivers.map(function(driver) {
+                var etaData = etaResults.find(function(e) { return e.driverId === driver.id; });
+                var eta = etaData ? etaData.eta : 10;
+                var source = etaData ? etaData.source : 'default';
+                var traffic = etaData ? etaData.traffic : 'unknown';
+                
+                return scoreDriverWithETA(driver, eta, source, traffic, weather);
+            });
+            
+            return buildSuggestionResult(scored, 'google-api');
+        });
+    }
+    
+    /**
+     * Get list of eligible drivers (clocked in, not on break, can accept trip)
+     */
+    function getEligibleDrivers() {
+        return DATA.roster.filter(function(d) {
+            if (DATA.shift.indexOf(d.id) === -1) return false;
+            
+            var onBreak = DATA.breaks.find(function(b) {
+                return b.driverId === d.id && b.active;
+            });
+            if (onBreak) return false;
+            
+            return canDriverAcceptTrip(d.id);
+        });
+    }
+    
+    /**
+     * Score a driver (SYNC version - uses calculateApproachTime)
+     */
+    function scoreDriver(driver, pickupPos, weather, mode) {
+        var score = 0;
+        var factors = {
+            distance: 0,
+            availability: 0,
+            turnSequence: 0,
+            etaSource: mode
+        };
+        
+        // 1. Distance/ETA Factor (60% weight)
+        var position = getDriverPosition(driver.id);
+        var eta = 999;
+        if (position) {
+            eta = calculateApproachTime(position, pickupPos, weather);
+            factors.distance = Math.max(0, 100 - (eta * eta * 0.3));
+        } else {
+            factors.distance = 10;
+        }
+        
+        // 2. Availability Factor (25% weight)
+        var activeTrip = getActiveTrip(driver.id);
+        if (!activeTrip) {
+            factors.availability = 100;
+        } else {
+            var remainingMins = Math.max(0, Math.ceil((activeTrip.end - Date.now()) / 60000));
+            factors.availability = Math.max(0, 100 - (remainingMins * 5));
+            eta += remainingMins;
+        }
+        
+        // Stacked trips penalty
+        var stackedCount = getStackedTrips(driver.id).length;
+        factors.availability -= stackedCount * 20;
+        
+        // 3. Turn Sequence Factor (15% weight) - fairness rotation
+        // Drivers earlier in turnSequence (haven't had a trip recently) get bonus
+        var turnIndex = DATA.turnSequence.indexOf(driver.id);
+        if (turnIndex === -1) {
+            // Not in sequence yet - treat as first priority
+            factors.turnSequence = 100;
+        } else {
+            // Earlier in sequence = higher score (inverse of position)
+            var totalDrivers = DATA.turnSequence.length;
+            factors.turnSequence = Math.max(0, 100 - (turnIndex * (100 / Math.max(1, totalDrivers))));
+        }
+        
+        // Weighted scoring: distance 60%, availability 25%, fairness 15%
+        score = (factors.distance * 0.60) + (factors.availability * 0.25) + (factors.turnSequence * 0.15);
+        
+        return {
+            driver: driver,
+            score: score,
+            eta: eta,
+            factors: factors
+        };
+    }
+    
+    /**
+     * Score a driver with pre-fetched ETA (ASYNC version)
+     */
+    function scoreDriverWithETA(driver, eta, etaSource, traffic, weather) {
+        var score = 0;
+        var factors = {
+            distance: 0,
+            availability: 0,
+            turnSequence: 0,
+            etaSource: etaSource,
+            traffic: traffic
+        };
+        
+        // 1. Distance/ETA Factor (60% weight) - using real API ETA
+        factors.distance = Math.max(0, 100 - (eta * eta * 0.3));
+        
+        // Traffic bonus/penalty
+        if (traffic === 'light') factors.distance += 5;
+        if (traffic === 'heavy') factors.distance -= 10;
+        
+        // 2. Availability Factor (25% weight)
+        var activeTrip = getActiveTrip(driver.id);
+        var effectiveETA = eta;
+        
+        if (!activeTrip) {
+            factors.availability = 100;
+        } else {
+            var remainingMins = Math.max(0, Math.ceil((activeTrip.end - Date.now()) / 60000));
+            factors.availability = Math.max(0, 100 - (remainingMins * 5));
+            effectiveETA += remainingMins;
+        }
+        
+        // Stacked trips penalty
+        var stackedCount = getStackedTrips(driver.id).length;
+        factors.availability -= stackedCount * 20;
+        
+        // 3. Turn Sequence Factor (15% weight) - fairness rotation
+        var turnIndex = DATA.turnSequence.indexOf(driver.id);
+        if (turnIndex === -1) {
+            factors.turnSequence = 100;
+        } else {
+            var totalDrivers = DATA.turnSequence.length;
+            factors.turnSequence = Math.max(0, 100 - (turnIndex * (100 / Math.max(1, totalDrivers))));
+        }
+        
+        // Weighted scoring: distance 60%, availability 25%, fairness 15%
+        score = (factors.distance * 0.60) + (factors.availability * 0.25) + (factors.turnSequence * 0.15);
+        
+        return {
+            driver: driver,
+            score: score,
+            eta: effectiveETA,
+            factors: factors
+        };
+    }
+    
+    /**
+     * Build suggestion result from scored drivers
+     */
+    function buildSuggestionResult(scored, source) {
+        // Sort by score (highest first)
+        scored.sort(function(a, b) { return b.score - a.score; });
+        
+        // Debug output
+        console.log('═══════════════════════════════════════');
+        console.log('📊 DRIVER SCORING RESULTS (' + source + '):');
+        console.log('   Weights: Distance 60% | Availability 25% | Fairness 15%');
+        scored.forEach(function(s, index) {
+            var etaSrc = s.factors.etaSource || 'unknown';
+            var traffic = s.factors.traffic ? ' [' + s.factors.traffic + ']' : '';
+            var turnSeq = s.factors.turnSequence !== undefined ? s.factors.turnSequence.toFixed(1) : 'N/A';
+            console.log((index + 1) + '. ' + s.driver.name + 
+                ' | Score: ' + s.score.toFixed(1) + 
+                ' | ETA: ' + s.eta + 'm' + traffic +
+                ' | Dist: ' + s.factors.distance.toFixed(1) + 
+                ' | Avail: ' + s.factors.availability.toFixed(1) +
+                ' | Fair: ' + turnSeq +
+                ' (' + etaSrc + ')');
+        });
+        console.log('═══════════════════════════════════════');
+        
+        var primary = scored[0];
+        var alternate = scored[1] || null;
+        
+        // Build reasoning string
+        var reasoning = primary.driver.name;
+        if (primary.factors.availability === 100) {
+            reasoning += ' available now';
+        } else {
+            reasoning += ' available soon';
+        }
+        reasoning += ', ~' + primary.eta + ' min ETA';
+        if (primary.factors.traffic && primary.factors.traffic !== 'unknown') {
+            reasoning += ' (' + primary.factors.traffic + ' traffic)';
+        }
+        
+        // Determine confidence based on source and score
+        var confidence = 'medium';
+        if (source === 'google-api' && primary.score > 70) {
+            confidence = 'high';
+        } else if (primary.score > 80) {
+            confidence = 'high';
+        } else if (primary.score < 50) {
+            confidence = 'low';
+        }
+        
+        console.log('✅ SELECTED:', primary.driver.name, 'Score:', primary.score.toFixed(1), '(' + source + ')');
+        
+        return {
+            primary: primary.driver.id,
+            alternate: alternate ? alternate.driver.id : null,
+            reasoning: reasoning,
+            confidence: confidence,
+            source: source,
+            primaryETA: primary.eta,
+            alternateETA: alternate ? alternate.eta : null,
+            scoreBreakdown: {
+                primary: primary.factors,
+                alternate: alternate ? alternate.factors : null
+            }
+        };
+    }
+    
+    // Legacy alias
+    function calculateBestDriver(job) {
+        return calculateBestDriverSync(job);
+    }
+
+    // ========================================================================
+    // EXPOSE TO GLOBAL SCOPE
+    // ========================================================================
+    
+    window.TimingService = {
+        // Utilities
+        haversineDistance: haversineDistance,
+        getDriverPosition: getDriverPosition,
+        formatDuration: formatDuration,
+        
+        // ETA Cache
+        getCachedETA: getCachedETA,
+        cacheETA: cacheETA,
+        cleanETACache: cleanETACache,
+        
+        // Driver ETAs (Google API)
+        getDriverETAAsync: getDriverETAAsync,
+        getAllDriverETAs: getAllDriverETAs,
+        
+        // Driver Analysis
+        analyzeDriverAvailability: analyzeDriverAvailability,
+        getEligibleDrivers: getEligibleDrivers,
+        
+        // Pickup Quotes
+        calculatePickupQuote: calculatePickupQuote,           // Sync (cache/fallback)
+        calculatePickupQuoteAsync: calculatePickupQuoteAsync, // Async (Google API)
+        
+        // Global ETA
+        calculateDeterministicETA: calculateDeterministicETA,
+        calculateGlobalTaxiETA: calculateGlobalTaxiETA,
+        updateGlobalETA: updateGlobalETA,
+        
+        // LLM Integration
+        LLM: LLMTimingService,
+        
+        // Phase Management
+        recalculateRemainingRoute: recalculateRemainingRoute,
+        adjustBuffer: adjustBuffer,
+        
+        // Driver Suggestion
+        getSuggestedDrivers: getSuggestedDrivers,               // Sync (immediate UI)
+        getSuggestedDriversAsync: getSuggestedDriversAsync,     // Async (accurate assignment)
+        calculateBestDriver: calculateBestDriver,               // Legacy sync alias
+        calculateBestDriverSync: calculateBestDriverSync,
+        calculateBestDriverAsync: calculateBestDriverAsync,
+        
+        // Constants (for debugging)
+        CONSTANTS: TIMING_CONSTANTS
+    };
+    
+    // ========================================================================
+    // LIVE PICKUP ETA SYSTEM (Real-time ETA as dispatcher types)
+    // ========================================================================
+    
+    // Track current pickup location for live ETA
+    var livePickupState = {
+        lat: null,
+        lon: null,
+        locationName: null,
+        lastUpdate: null
+    };
+    
+    /**
+     * Calculate and display live ETA for a specific pickup location
+     * Called by pre-parser after geocoding pickup address
+     * @param {Number} lat - Pickup latitude
+     * @param {Number} lon - Pickup longitude  
+     * @param {String} locationName - Display name for the pickup location
+     */
+    function calculateLivePickupETA(lat, lon, locationName) {
+        console.log('📍 [Live ETA] Calculating for pickup:', locationName || (lat + ',' + lon));
+        
+        // Store pickup state
+        livePickupState.lat = lat;
+        livePickupState.lon = lon;
+        livePickupState.locationName = locationName || 'Custom location';
+        livePickupState.lastUpdate = Date.now();
+        
+        // Get UI elements
+        var etaEl = document.getElementById('global-eta');
+        var containerEl = document.getElementById('global-eta-container');
+        var labelEl = document.getElementById('global-eta-label');
+        
+        if (!etaEl || !containerEl) {
+            console.warn('📍 [Live ETA] Display elements not found');
+            return;
+        }
+        
+        // Show loading state
+        etaEl.textContent = '...';
+        containerEl.style.background = 'rgba(52, 152, 219, 0.25)';
+        containerEl.style.borderColor = 'rgba(52, 152, 219, 0.5)';
+        if (labelEl) {
+            labelEl.textContent = 'ETA to ' + truncateLocation(locationName || 'pickup');
+        }
+        
+        // Use async API for accurate route-based ETA
+        var pickupCoords = [lon, lat]; // [lon, lat] format for calculatePickupQuoteAsync
+        
+        calculatePickupQuoteAsync(pickupCoords).then(function(quote) {
+            console.log('📍 [Live ETA] Quote received:', quote);
+            
+            // Verify this is still the current pickup (user may have changed it)
+            if (livePickupState.lat !== lat || livePickupState.lon !== lon) {
+                console.log('📍 [Live ETA] Pickup changed, ignoring stale result');
+                return;
+            }
+            
+            updateLiveETADisplay(quote, locationName);
+        }).catch(function(err) {
+            console.warn('📍 [Live ETA] Async failed, using sync:', err.message);
+            
+            // Fallback to sync calculation
+            var syncQuote = calculatePickupQuote(pickupCoords);
+            updateLiveETADisplay(syncQuote, locationName);
+        });
+    }
+    
+    /**
+     * Truncate location name for display
+     */
+    function truncateLocation(name) {
+        if (!name) return 'pickup';
+        if (name.length <= 20) return name;
+        return name.substring(0, 18) + '...';
+    }
+    
+    /**
+     * Update the ETA display with live pickup-specific ETA
+     */
+    function updateLiveETADisplay(quote, locationName) {
+        var etaEl = document.getElementById('global-eta');
+        var containerEl = document.getElementById('global-eta-container');
+        var labelEl = document.getElementById('global-eta-label');
+        
+        if (!etaEl || !containerEl) return;
+        
+        var eta = quote.quotedMinutes;
+        
+        // Update display
+        if (eta >= 60) {
+            var hours = Math.floor(eta / 60);
+            var mins = eta % 60;
+            etaEl.textContent = hours + 'h ' + mins + 'm';
+        } else {
+            etaEl.textContent = eta + ' min';
+        }
+        
+        // Color based on ETA
+        if (eta <= 5) {
+            containerEl.style.background = 'rgba(39, 174, 96, 0.25)';
+            containerEl.style.borderColor = 'rgba(39, 174, 96, 0.5)';
+        } else if (eta <= 10) {
+            containerEl.style.background = 'rgba(46, 204, 113, 0.25)';
+            containerEl.style.borderColor = 'rgba(46, 204, 113, 0.5)';
+        } else if (eta <= 15) {
+            containerEl.style.background = 'rgba(241, 196, 15, 0.25)';
+            containerEl.style.borderColor = 'rgba(241, 196, 15, 0.5)';
+        } else if (eta <= 20) {
+            containerEl.style.background = 'rgba(230, 126, 34, 0.25)';
+            containerEl.style.borderColor = 'rgba(230, 126, 34, 0.5)';
+        } else {
+            containerEl.style.background = 'rgba(231, 76, 60, 0.25)';
+            containerEl.style.borderColor = 'rgba(231, 76, 60, 0.5)';
+        }
+        
+        // Update label to show this is pickup-specific
+        if (labelEl) {
+            labelEl.textContent = 'ETA to ' + truncateLocation(locationName);
+        }
+        
+        // Build tooltip with driver info
+        var tooltipLines = [
+            '📍 LIVE ETA to: ' + (locationName || 'pickup location'),
+            'Quoted: ' + eta + ' min (' + (quote.source || 'calculated') + ')',
+            ''
+        ];
+        
+        if (quote.drivers && quote.drivers.length > 0) {
+            tooltipLines.push('Nearest drivers:');
+            quote.drivers.forEach(function(d, i) {
+                var trafficInfo = d.traffic ? ' [' + d.traffic + ']' : '';
+                var distInfo = d.distance ? ' (' + d.distance + ')' : '';
+                tooltipLines.push((i + 1) + '. ' + d.name + ': ' + d.eta + ' min' + distInfo + trafficInfo);
+            });
+        }
+        
+        if (quote.weather) {
+            tooltipLines.push('');
+            tooltipLines.push('Weather: ' + quote.weather);
+        }
+        
+        containerEl.title = tooltipLines.join('\n');
+        
+        console.log('📍 [Live ETA] Display updated: ' + eta + ' min to ' + locationName);
+        
+        // ALSO update the dispatch estimate box with pickup ETA
+        updateDispatchEstimatePickup(eta, locationName, quote.source || 'Live');
+    }
+    
+    /**
+     * Clear live pickup ETA and return to generic global ETA
+     */
+    function clearLivePickupETA() {
+        console.log('📍 [Live ETA] Clearing pickup-specific ETA');
+        
+        livePickupState.lat = null;
+        livePickupState.lon = null;
+        livePickupState.locationName = null;
+        livePickupState.lastUpdate = null;
+        
+        // Reset label
+        var labelEl = document.getElementById('global-eta-label');
+        if (labelEl) {
+            labelEl.textContent = 'TAXI ETA';
+        }
+        
+        // Refresh to generic global ETA
+        updateGlobalETA();
+    }
+    
+    /**
+     * Check if we have an active live pickup ETA
+     */
+    function hasLivePickupETA() {
+        return livePickupState.lat !== null && livePickupState.lon !== null;
+    }
+    
+    // ========================================================================
+    // DISPATCH ESTIMATE BOX - Real-time updates in dispatch pane
+    // ========================================================================
+    
+    /**
+     * Update the dispatch estimate box with pickup ETA
+     * Called after pickup location is parsed/geocoded
+     */
+    function updateDispatchEstimatePickup(etaMinutes, locationName, source) {
+        var etaValueEl = document.getElementById('estimate-eta-value');
+        var sourceEl = document.getElementById('estimate-source');
+        var boxEl = document.getElementById('estimate-box');
+        
+        if (!etaValueEl || !boxEl) return;
+        
+        // Update pickup ETA value
+        if (etaMinutes !== null && etaMinutes !== undefined) {
+            if (etaMinutes >= 60) {
+                var hours = Math.floor(etaMinutes / 60);
+                var mins = etaMinutes % 60;
+                etaValueEl.textContent = hours + 'h ' + mins + 'm';
+            } else {
+                etaValueEl.textContent = etaMinutes + ' min';
+            }
+            etaValueEl.style.color = getETAColor(etaMinutes);
+        } else {
+            etaValueEl.textContent = '--';
+            etaValueEl.style.color = 'rgba(255,255,255,0.4)';
+        }
+        
+        // Update source badge
+        if (sourceEl) {
+            sourceEl.textContent = source || 'Live calculation';
+            sourceEl.style.background = 'rgba(46, 204, 113, 0.3)';
+            sourceEl.style.color = 'rgba(46, 204, 113, 1)';
+        }
+        
+        // Update box styling to show it's active
+        boxEl.style.background = 'rgba(46, 204, 113, 0.15)';
+        boxEl.style.borderColor = 'rgba(46, 204, 113, 0.4)';
+        
+        console.log('📊 [Dispatch Estimate] Pickup ETA updated:', etaMinutes, 'min to', locationName);
+    }
+    
+    /**
+     * Update the dispatch estimate box with full trip estimate
+     * Called after both pickup and dropoff are known
+     */
+    function updateDispatchEstimateTrip(tripMinutes, fareEstimate, routeDescription) {
+        var tripValueEl = document.getElementById('estimate-trip-value');
+        var fareValueEl = document.getElementById('estimate-fare-value');
+        var routeEl = document.getElementById('estimate-route');
+        var routeTextEl = document.getElementById('estimate-route-text');
+        
+        // Update trip time
+        if (tripValueEl) {
+            if (tripMinutes !== null && tripMinutes !== undefined) {
+                if (tripMinutes >= 60) {
+                    var hours = Math.floor(tripMinutes / 60);
+                    var mins = tripMinutes % 60;
+                    tripValueEl.textContent = hours + 'h ' + mins + 'm';
+                } else {
+                    tripValueEl.textContent = tripMinutes + ' min';
+                }
+                tripValueEl.style.color = '#fff';
+            } else {
+                tripValueEl.textContent = '--';
+                tripValueEl.style.color = 'rgba(255,255,255,0.4)';
+            }
+        }
+        
+        // Fare estimate removed from UI
+        
+        // Update route description
+        if (routeEl && routeTextEl && routeDescription) {
+            routeTextEl.textContent = routeDescription;
+            routeEl.style.display = 'block';
+        }
+        
+        console.log('📊 [Dispatch Estimate] Trip updated:', tripMinutes, 'min, $' + fareEstimate);
+    }
+    
+    /**
+     * Clear the dispatch estimate box
+     */
+    function clearDispatchEstimate() {
+        var etaValueEl = document.getElementById('estimate-eta-value');
+        var tripValueEl = document.getElementById('estimate-trip-value');
+        var fareValueEl = document.getElementById('estimate-fare-value');
+        var sourceEl = document.getElementById('estimate-source');
+        var routeEl = document.getElementById('estimate-route');
+        var boxEl = document.getElementById('estimate-box');
+        
+        if (etaValueEl) {
+            etaValueEl.textContent = '--';
+            etaValueEl.style.color = 'rgba(255,255,255,0.4)';
+        }
+        if (tripValueEl) {
+            tripValueEl.textContent = '--';
+            tripValueEl.style.color = 'rgba(255,255,255,0.4)';
+        }
+        if (fareValueEl) {
+            fareValueEl.textContent = '--';
+            fareValueEl.style.color = 'rgba(255,255,255,0.4)';
+        }
+        if (sourceEl) {
+            sourceEl.textContent = 'Awaiting locations...';
+            sourceEl.style.background = 'rgba(255,255,255,0.1)';
+            sourceEl.style.color = 'rgba(255,255,255,0.5)';
+        }
+        if (routeEl) {
+            routeEl.style.display = 'none';
+        }
+        if (boxEl) {
+            boxEl.style.background = 'rgba(52, 152, 219, 0.15)';
+            boxEl.style.borderColor = 'rgba(52, 152, 219, 0.4)';
+        }
+        
+        console.log('📊 [Dispatch Estimate] Cleared');
+    }
+    
+    /**
+     * Get color based on ETA value
+     */
+    function getETAColor(minutes) {
+        if (minutes <= 5) return '#2ecc71';
+        if (minutes <= 10) return '#27ae60';
+        if (minutes <= 15) return '#f1c40f';
+        if (minutes <= 20) return '#e67e22';
+        return '#e74c3c';
+    }
+    
+    // Legacy compatibility (for existing code that uses these directly)
+    window.LLMTimingService = LLMTimingService;
+    window.calculateGlobalTaxiETA = calculateGlobalTaxiETA;
+    window.updateGlobalETA = updateGlobalETA;
+    window.calculateLivePickupETA = calculateLivePickupETA;
+    window.clearLivePickupETA = clearLivePickupETA;
+    window.hasLivePickupETA = hasLivePickupETA;
+    window.analyzeDriverAvailability = analyzeDriverAvailability;
+    window.calculateDeterministicETA = calculateDeterministicETA;
+    window.adjustBuffer = adjustBuffer;
+    window.haversineDistance = haversineDistance;
+    window.getDriverPosition = getDriverPosition;
+    window.calculatePickupQuote = calculatePickupQuote;
+    window.calculatePickupQuoteAsync = calculatePickupQuoteAsync;
+    window.getDriverETAAsync = getDriverETAAsync;
+    window.getAllDriverETAs = getAllDriverETAs;
+    window.getSuggestedDriversAsync = getSuggestedDriversAsync;
+    
+    // Dispatch estimate box functions
+    window.updateDispatchEstimatePickup = updateDispatchEstimatePickup;
+    window.updateDispatchEstimateTrip = updateDispatchEstimateTrip;
+    window.clearDispatchEstimate = clearDispatchEstimate;
+    
+    console.log('✅ kernel-timing.js v2.0 loaded (Google Directions API integration)');
+
+})();

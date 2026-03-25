@@ -1,0 +1,6 @@
+
+
+Semantic Pre-Parser
+	->Dictated Natural Language
+	->LLM Format
+-Start of Shift Batch Process for adding several Calls into the Queue Pane.

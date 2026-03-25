@@ -1,0 +1,814 @@
+Index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hello Taxi Dispatch V94</title>
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Application Styles -->
+    <link rel="stylesheet" href="css/styles_v3.css?v=1">
+</head>
+<body>
+
+<!-- Fullscreen Map -->
+<div id="map"></div>
+
+<!-- Date/Time Widget (Center Top) -->
+<div id="datetime-widget">
+    <div id="system-date">Loading...</div>
+    <div id="system-time">--:--:--</div>
+    <div id="system-messages-widget" style="
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+        padding: 8px 12px;
+        margin-top: 8px;
+        max-width: 400px;
+    ">
+        <div style="font-size: 0.75em; opacity: 0.7; margin-bottom: 3px; font-weight: 600;">System Messages</div>
+        <div id="system-messages-log" style="font-size: 0.7em; max-height: 40px; overflow: hidden;"></div>
+    </div>
+</div>
+
+<!-- DISPATCH PANE (Left) -->
+<div class="glass-pane" id="dispatch-pane">
+    <div class="pane-header" onclick="togglePaneCollapse('dispatch-pane')">
+        <div class="pane-title">Dispatch</div>
+    </div>
+    <div class="pane-content">
+        <!-- Pre-Parser CLI (Always Visible) -->
+        <div class="dispatch-cli-section">
+            <div style="padding: 12px; background: rgba(0,0,0,0.3); border-radius: 8px; margin-bottom: 12px;">
+                <div class="form-label" style="display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 8px;">
+                    <span style="font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">
+                        <i class="fas fa-microphone-alt" style="margin-right: 6px;"></i>Input
+                    </span>
+                </div>
+                <textarea id="dispatch-llm-input" 
+                    class="form-input"
+                    placeholder="Dictate or type: 'Hi this is Maria 204-555-1234 at 123 Main Street going to Walmart wheelchair call when arrive'"
+                    style="min-height: 70px; resize: vertical; margin-bottom: 8px; font-size: 13px; line-height: 1.4;"></textarea>
+                <div id="dispatch-llm-status" style="display: none; padding: 10px; border-radius: 6px; font-size: 13px; text-align: center;"></div>
+            </div>
+        </div>
+        
+        <!-- Call Summary Widget (Editable Form) -->
+        <div id="call-summary-widget" style="margin-bottom: 12px; padding: 14px; background: rgba(0, 0, 0, 0.25); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.2);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <div style="font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.7); text-transform: uppercase; letter-spacing: 0.8px;">
+                    <i class="fas fa-phone-alt" style="margin-right: 6px;"></i>Call Summary
+                </div>
+                <div id="llm-status-badge" style="font-size: 0.65em; padding: 2px 8px; border-radius: 4px; background: #95a5a6; color: #fff; font-weight: 600;">
+                    Checking LLM...
+                </div>
+            </div>
+            
+            <!-- Phone & Name Row -->
+            <div class="form-row" style="margin-bottom: 10px;">
+                <div class="form-group" style="flex: 0 0 130px;">
+                    <label class="form-label" style="font-size: 10px;">Phone <span id="summary-phone-confidence"></span></label>
+                    <input type="tel" id="dispatch-phone" class="form-input" placeholder="204-555-1234" onchange="recallPickup()" style="font-size: 13px;">
+                </div>
+                <div class="form-group" style="flex: 1;">
+                    <label class="form-label" style="font-size: 10px;">Name <span id="summary-name-confidence"></span></label>
+                    <input type="text" id="dispatch-name" class="form-input" placeholder="Customer name" style="font-size: 13px;">
+                </div>
+            </div>
+            
+            <div style="border-top: 1px solid rgba(255,255,255,0.1); margin: 10px 0;"></div>
+            
+            <!-- Pickup -->
+            <div class="form-group" style="position: relative; margin-bottom: 10px;">
+                <label class="form-label" style="font-size: 10px;">Pickup <span id="summary-pickup-confidence"></span></label>
+                <div style="display: flex; gap: 6px;">
+                    <input type="text" id="dispatch-pickup" class="form-input" placeholder="Enter pickup address" style="flex: 1; font-size: 13px;">
+                    <button class="btn btn-sm" onclick="mapPick('start')" title="Pick on map" style="padding: 6px 10px;">
+                        <i class="fas fa-map-marker-alt"></i>
+                    </button>
+                </div>
+                <div id="pickup-suggestions" class="suggestions" style="display: none;"></div>
+            </div>
+            
+            <!-- Add Stop / Return Trip Buttons -->
+            <div class="form-row" style="margin-bottom: 10px; gap: 8px;">
+                <button class="btn btn-sm" onclick="addWaypoint()" style="flex: 1; font-size: 11px; padding: 6px 8px;">
+                    <i class="fas fa-plus"></i> Add Stop
+                </button>
+                <button class="btn btn-sm" onclick="addReturnTrip()" style="flex: 1; font-size: 11px; padding: 6px 8px;">
+                    <i class="fas fa-undo"></i> Return Trip
+                </button>
+            </div>
+            
+            <!-- Waypoints Container (Dynamic) -->
+            <div id="waypoints-container" style="margin-bottom: 0;"></div>
+            
+            <!-- Dropoff -->
+            <div class="form-group" style="position: relative; margin-bottom: 10px;">
+                <label class="form-label" style="font-size: 10px;">Dropoff <span id="summary-dropoff-confidence"></span></label>
+                <div style="display: flex; gap: 6px;">
+                    <input type="text" id="dispatch-dropoff" class="form-input" placeholder="Enter dropoff address" style="flex: 1; font-size: 13px;">
+                    <button class="btn btn-sm" onclick="mapPick('end')" title="Pick on map" style="padding: 6px 10px;">
+                        <i class="fas fa-map-marker-alt"></i>
+                    </button>
+                </div>
+                <div id="dropoff-suggestions" class="suggestions" style="display: none;"></div>
+            </div>
+            
+            <div style="border-top: 1px solid rgba(255,255,255,0.1); margin: 10px 0;"></div>
+            
+            <!-- Prebook Section -->
+            <div class="form-row" style="margin-bottom: 10px;">
+                <div class="form-group" style="flex: 1;">
+                    <label class="form-label" style="font-size: 10px;">Date <span id="summary-date-confidence"></span></label>
+                    <input type="date" id="dispatch-prebook-date" class="form-input" style="font-size: 12px;">
+                </div>
+                <div class="form-group" style="flex: 1;">
+                    <label class="form-label" style="font-size: 10px;">Time <span id="summary-time-confidence"></span></label>
+                    <input type="time" id="dispatch-prebook-time" class="form-input" style="font-size: 12px;">
+                </div>
+            </div>
+            
+            <!-- Notes -->
+            <div class="form-group" style="margin-bottom: 10px;">
+                <label class="form-label" style="font-size: 10px;">Notes <span id="summary-notes-confidence"></span></label>
+                <textarea id="dispatch-notes" class="form-input" rows="2" placeholder="Special instructions..." style="font-size: 12px; resize: vertical;"></textarea>
+            </div>
+            
+            <!-- Trip Name (LLM Generated) -->
+            <div class="form-group" style="margin-bottom: 0;">
+                <label class="form-label" style="font-size: 10px;">Trip Name <span style="opacity: 0.5; font-style: italic;">(auto-generated)</span></label>
+                <input type="text" id="dispatch-tripname" class="form-input" placeholder="Generated after processing..." style="font-size: 13px; font-weight: 600;">
+            </div>
+        </div>
+        
+        <!-- Estimate Box (Always visible - updates in real-time from parser) -->
+        <div id="estimate-box" style="background: rgba(52, 152, 219, 0.15); border: 1px solid rgba(52, 152, 219, 0.4); border-radius: 8px; padding: 12px; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div id="estimate-label" style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(255,255,255,0.7);">
+                    <i class="fas fa-clock" style="margin-right: 6px;"></i>Trip Estimate
+                </div>
+                <div id="estimate-source" style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.5);">
+                    Awaiting locations...
+                </div>
+            </div>
+            <div id="estimate-content" style="display: flex; gap: 24px; align-items: center;">
+                <div id="estimate-eta" style="flex: 1;">
+                    <div style="font-size: 10px; color: rgba(255,255,255,0.5); margin-bottom: 2px;">Pickup ETA</div>
+                    <div id="estimate-eta-value" style="font-size: 26px; font-weight: 700; color: rgba(255,255,255,0.4);">--</div>
+                </div>
+                <div id="estimate-trip" style="flex: 1;">
+                    <div style="font-size: 10px; color: rgba(255,255,255,0.5); margin-bottom: 2px;">Trip Time</div>
+                    <div id="estimate-trip-value" style="font-size: 26px; font-weight: 700; color: rgba(255,255,255,0.4);">--</div>
+                </div>
+            </div>
+            <div id="estimate-route" style="font-size: 11px; color: rgba(255,255,255,0.5); margin-top: 8px; display: none;">
+                <i class="fas fa-route" style="margin-right: 4px;"></i>
+                <span id="estimate-route-text"></span>
+            </div>
+        </div>
+        
+        <!-- Action Buttons -->
+        <div class="dispatch-actions-primary" style="margin-bottom: 12px;">
+            <div class="form-row" style="gap: 8px;">
+                <button class="btn btn-primary" onclick="processDispatchLLM()" style="flex: 1;">
+                    <i class="fas fa-magic"></i> Process with
+                    <span style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 2px 6px; border-radius: 4px; margin-left: 4px; font-size: 0.85em;">Qwen</span>
+                </button>
+            </div>
+            <div class="form-row" style="gap: 8px; margin-top: 8px;">
+                <button class="btn btn-success" onclick="addToQueue()" style="flex: 1;">
+                    <i class="fas fa-plus-circle"></i> Add to Queue
+                </button>
+                <button class="btn" onclick="clearForm()" style="flex: 0 0 80px;">
+                    <i class="fas fa-times"></i> Clear
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- QUEUE PANE (Center-Left) -->
+<div class="glass-pane" id="queue-pane">
+    <div class="pane-header" onclick="togglePaneCollapse('queue-pane')">
+        <div class="pane-title">
+            Queue
+            <span class="pane-badge" id="q-badge">0</span>
+        </div>
+    </div>
+    <div class="pane-content" id="queue-content">
+        <div class="text-center" style="padding: 40px 20px; color: rgba(255, 255, 255, 0.5);">
+            <i class="fas fa-list fa-3x mb-2" style="opacity: 0.3;"></i>
+            <p>No pending trips</p>
+        </div>
+    </div>
+</div>
+
+<!-- DRIVERS PANE / LIVE (Center-Right) -->
+<div class="glass-pane" id="drivers-pane">
+    <div class="pane-header" onclick="togglePaneCollapse('drivers-pane')">
+        <div class="pane-title">
+            Live
+            <span class="pane-badge" id="l-badge">0</span>
+        </div>
+        <button id="toggle-live-calls-btn" class="btn btn-sm" onclick="event.stopPropagation(); toggleShowAllLiveCalls();" style="padding: 4px 10px; font-size: 11px;">
+            <i class="fas fa-eye"></i> Show Live
+        </button>
+    </div>
+    <div class="pane-content" id="live-content">
+        <div class="text-center" style="padding: 40px 20px; color: rgba(255, 255, 255, 0.5);">
+            <i class="fas fa-car fa-3x mb-2" style="opacity: 0.3;"></i>
+            <p>No active trips</p>
+        </div>
+    </div>
+</div>
+
+<!-- NOTES PANE (Left - formerly Messages) -->
+<div class="glass-pane" id="messenger-pane">
+    <div class="pane-header" onclick="togglePaneCollapse('messenger-pane')">
+        <div class="pane-title">Notes</div>
+    </div>
+    <div class="pane-content" style="padding: 12px; display: flex; flex-direction: column; height: 100%;">
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+            <button class="btn btn-sm" onclick="SessionNotes.clear()" title="Clear all notes" style="padding: 4px 8px; font-size: 11px;">
+                <i class="fas fa-eraser"></i>
+            </button>
+        </div>
+        <textarea 
+            id="session-notes-textarea" 
+            placeholder="Type your notes here..."
+            style="width: 100%; flex: 1; background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border); border-radius: 8px; padding: 12px; color: var(--text-primary); font-size: 13px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; resize: none;"
+            oninput="SessionNotes.save()"
+        ></textarea>
+        <div style="margin-top: 8px; text-align: right;">
+            <span style="color: rgba(255,255,255,0.5); font-size: 11px;" id="notes-save-status">
+                <i class="fas fa-check-circle"></i> Auto-saved
+            </span>
+        </div>
+    </div>
+</div>
+
+<!-- Bottom Navigation -->
+<div class="bottom-nav">
+    <div class="nav-btn active" onclick="toggleView('workspace')">Workspace</div>
+    <div class="nav-btn" onclick="toggleView('roster')">Roster</div>
+    <div class="nav-btn" onclick="toggleView('sheet')">Dispatch Sheet</div>
+    <div class="nav-btn" onclick="toggleView('settings')">Settings & Data</div>
+</div>
+
+<!-- Roster Overlay -->
+<div id="roster-overlay" class="overlay" style="display: none;">
+    <div class="overlay-backdrop" onclick="toggleView('workspace')"></div>
+    <div class="overlay-content">
+        <div class="overlay-header">
+            <h2>Driver Roster</h2>
+            <button class="close-btn" onclick="toggleView('workspace')">✕</button>
+        </div>
+        <div class="overlay-body">
+            <!-- Driver Form -->
+            <div class="roster-form">
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px;">Add/Edit Driver</h3>
+                
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Driver Name</label>
+                        <input type="text" id="driver-name" class="form-input" placeholder="Enter driver name">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Phone Number</label>
+                        <input type="tel" id="driver-phone" class="form-input" placeholder="204-555-1234">
+                    </div>
+                </div>
+                
+                <div class="form-row">
+                    <div class="form-group" style="flex: 0 0 120px;">
+                        <label class="form-label">Car #</label>
+                        <input type="text" id="driver-car" class="form-input" placeholder="1" maxlength="2">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Color</label>
+                        <div class="swatches" id="color-swatches"></div>
+                    </div>
+                </div>
+                
+                <div class="form-row">
+                    <button id="roster-submit-btn" class="btn btn-primary" onclick="addDriver()">
+                        <i class="fas fa-plus"></i> Create Driver
+                    </button>
+                    <button class="btn btn-danger" id="delete-driver-btn" onclick="deleteDriver()" style="display: none;">
+                        <i class="fas fa-trash"></i> Delete Driver
+                    </button>
+                    <button class="btn" onclick="clearDriverForm()">
+                        <i class="fas fa-times"></i> Clear
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Driver List -->
+            <div>
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px;">
+                    Driver List
+                    <span class="pane-badge" id="roster-count">0</span>
+                </h3>
+                <div id="roster-list"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Dispatch Sheet Overlay -->
+<div id="sheet-overlay" class="overlay" style="display: none;">
+    <div class="overlay-backdrop" onclick="toggleView('workspace')"></div>
+    <div class="overlay-content">
+        <div class="overlay-header">
+            <h2>Dispatch Sheet</h2>
+            <div style="display: flex; gap: 8px;">
+                <button class="btn btn-sm" onclick="exportSheetPDF()" title="Export to PDF">
+                    <i class="fas fa-file-pdf"></i> Export PDF
+                </button>
+                <button class="btn btn-sm" onclick="exportSheetToCluster()" title="Send to Cluster for archival" style="background: rgba(52, 152, 219, 0.3);">
+                    <i class="fas fa-cloud-upload-alt"></i> To Cluster
+                </button>
+                <button class="btn btn-sm btn-danger" onclick="deleteDispatchSheet()" title="Delete entire sheet">
+                    <i class="fas fa-trash"></i> Delete All
+                </button>
+                <button class="close-btn" onclick="toggleView('workspace')">✕</button>
+            </div>
+        </div>
+        <div class="overlay-body">
+            <!-- Date Navigation -->
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding: 12px; background: rgba(0,0,0,0.3); border-radius: 8px;">
+                <button class="btn btn-sm" onclick="sheetNavigate(-1)" title="Previous day">
+                    <i class="fas fa-chevron-left"></i>
+                </button>
+                
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <input type="date" id="sheet-date-picker" class="form-input" style="width: 160px;" onchange="setSheetDate(this.value)">
+                    <button class="btn btn-sm" onclick="setSheetDate('today')" title="Jump to today">
+                        <i class="fas fa-calendar-day"></i> Today
+                    </button>
+                </div>
+                
+                <button class="btn btn-sm" onclick="sheetNavigate(1)" title="Next day">
+                    <i class="fas fa-chevron-right"></i>
+                </button>
+            </div>
+            
+            <!-- Trip Count Badge -->
+            <div style="margin-bottom: 16px; text-align: center;">
+                <span class="pane-badge" id="sheet-trip-count">0</span>
+                <span style="margin-left: 8px; color: rgba(255,255,255,0.7); font-size: 14px;">trips completed</span>
+            </div>
+            
+            <!-- Sheet Table -->
+            <div id="sheet-table-container" style="overflow-x: auto;"></div>
+        </div>
+    </div>
+</div>
+
+
+<!-- Settings Overlay / Database -->
+<div id="settings-overlay" class="overlay" style="display: none;">
+    <div class="overlay-backdrop" onclick="toggleView('workspace')"></div>
+    <div class="overlay-content">
+        <div class="overlay-header">
+            <h2>Database & Settings</h2>
+            <button class="close-btn" onclick="toggleView('workspace')">✕</button>
+        </div>
+        <div class="overlay-body">
+            <!-- Section: Clients -->
+            <div style="margin-bottom: 40px;">
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--glass-border); padding-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="toggleSettingsSection('clients-section')">
+                    <span><i class="fas fa-users"></i> Clients <span class="pane-badge" id="clients-count">0</span></span>
+                    <i class="fas fa-chevron-down" id="clients-section-icon"></i>
+                </h3>
+                <div id="clients-section" style="display: none;">
+                
+                <!-- Add Client Form -->
+                <div class="roster-form" style="margin-bottom: 20px;">
+                    <h4 style="margin-bottom: 12px; font-size: 14px;">Add/Edit Client</h4>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">Phone Number</label>
+                            <input type="tel" id="client-phone" class="form-input" placeholder="204-555-1234">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Customer Name</label>
+                            <input type="text" id="client-name" class="form-input" placeholder="Customer name">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Notes</label>
+                        <textarea id="client-notes" class="form-input" rows="2" placeholder="Customer notes..."></textarea>
+                    </div>
+                    
+                    <div class="form-row">
+                        <button id="client-submit-btn" class="btn btn-primary" onclick="addClient()">
+                            <i class="fas fa-plus"></i> Add Client
+                        </button>
+                        <button class="btn btn-danger" id="delete-client-btn" onclick="deleteClient()" style="display: none;">
+                            <i class="fas fa-trash"></i> Delete Client
+                        </button>
+                        <button class="btn" onclick="clearClientForm()">
+                            <i class="fas fa-times"></i> Clear
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Client List -->
+                <div id="clients-list"></div>
+                </div>
+            </div>
+            
+            <!-- Section: Place Nicknames -->
+            <div style="margin-bottom: 40px;">
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--glass-border); padding-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="toggleSettingsSection('nicknames-section')">
+                    <span><i class="fas fa-map-marker-alt"></i> Place Nicknames <span class="pane-badge" id="nicknames-count">0</span></span>
+                    <i class="fas fa-chevron-down" id="nicknames-section-icon"></i>
+                </h3>
+                <div id="nicknames-section" style="display: none;">
+                
+                <!-- Add Nickname Form -->
+                <div class="roster-form" style="margin-bottom: 20px;">
+                    <h4 style="margin-bottom: 12px; font-size: 14px;">Add Place Nickname</h4>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">Nickname</label>
+                            <input type="text" id="nickname-short" class="form-input" placeholder="e.g., Tim's">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Formal Name</label>
+                            <input type="text" id="nickname-formal" class="form-input" placeholder="e.g., Tim Hortons">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group" style="position: relative;">
+                        <label class="form-label">Address</label>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="text" id="nickname-address" class="form-input" placeholder="Enter address" style="flex: 1;">
+                            <button class="btn btn-sm" onclick="mapPick('nickname')" title="Pick on map">
+                                <i class="fas fa-map-marker-alt"></i>
+                            </button>
+                        </div>
+                        <div id="nickname-suggestions" class="suggestions" style="display: none;"></div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <button id="nickname-submit-btn" class="btn btn-primary" onclick="addPlaceNickname()">
+                            <i class="fas fa-plus"></i> Add Nickname
+                        </button>
+                        <button class="btn btn-danger" id="delete-nickname-btn" onclick="deletePlaceNickname()" style="display: none;">
+                            <i class="fas fa-trash"></i> Delete
+                        </button>
+                        <button class="btn" onclick="clearNicknameForm()">
+                            <i class="fas fa-times"></i> Clear
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Nickname List -->
+                <div id="nicknames-list"></div>
+                </div>
+            </div>
+            
+
+            <!-- Section: LLM Corrections -->
+            <div style="margin-bottom: 40px;">
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--glass-border); padding-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="toggleSettingsSection('llm-corrections-section')">
+                    <span><i class="fas fa-spell-check"></i> LLM Corrections <span class="pane-badge" id="llm-corrections-count">0</span></span>
+                    <i class="fas fa-chevron-down" id="llm-corrections-section-icon"></i>
+                </h3>
+                <div id="llm-corrections-section" style="display: none;">
+                
+                <!-- Add LLM Correction Form -->
+                <div class="roster-form" style="margin-bottom: 20px;">
+                    <h4 style="margin-bottom: 12px; font-size: 14px;">Add LLM Correction</h4>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">Misheard Term</label>
+                            <input type="text" id="llm-misheard" class="form-input" placeholder='e.g., "France Motor In"'>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Correct Term</label>
+                            <input type="text" id="llm-correct" class="form-input" placeholder='e.g., "Frantz Motor Inn"'>
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <button class="btn btn-primary" onclick="addLLMCorrection()">
+                            <i class="fas fa-plus"></i> Add Correction
+                        </button>
+                        <button class="btn" onclick="clearLLMCorrectionForm()">
+                            <i class="fas fa-times"></i> Clear
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- LLM Corrections List -->
+                <div id="llm-corrections-list"></div>
+                </div>
+            </div>
+            
+            <!-- Section: Map Style Editor -->
+            <div style="margin-bottom: 40px;">
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--glass-border); padding-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="toggleSettingsSection('map-style-section')">
+                    <span><i class="fas fa-map"></i> Map Appearance</span>
+                    <i class="fas fa-chevron-down" id="map-style-section-icon"></i>
+                </h3>
+                <div id="map-style-section" style="display: none;">
+                
+                <!-- Style Presets -->
+                <div class="form-group">
+                    <label class="form-label">Style Presets</label>
+                    <div class="map-style-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px;">
+                        <button class="btn btn-map-style" onclick="event.stopPropagation(); setMapStyle('muted')" data-style="muted">Muted</button>
+                        <button class="btn btn-map-style" onclick="event.stopPropagation(); setMapStyle('cityroads')" data-style="cityroads">City Roads</button>
+                        <button class="btn btn-map-style" onclick="event.stopPropagation(); setMapStyle('blueprint')" data-style="blueprint">Blueprint</button>
+                        <button class="btn btn-map-style" onclick="event.stopPropagation(); setMapStyle('retro')" data-style="retro">Retro</button>
+                        <button class="btn btn-map-style" onclick="event.stopPropagation(); setMapStyle('night')" data-style="night">Night</button>
+                        <button class="btn btn-map-style" onclick="event.stopPropagation(); setMapStyle('default')" data-style="default">Default</button>
+                    </div>
+                </div>
+                
+                <!-- Map Overlays -->
+                <div class="form-group">
+                    <label class="form-label">Map Layers</label>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="btn btn-sm" onclick="toggleMapOption('traffic')">
+                            <i class="fas fa-car"></i> Traffic
+                        </button>
+                        <button class="btn btn-sm" onclick="toggleMapOption('transit')">
+                            <i class="fas fa-bus"></i> Transit
+                        </button>
+                        <button class="btn btn-sm" onclick="toggleMapOption('bicycling')">
+                            <i class="fas fa-bicycle"></i> Bicycling
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Custom Style JSON -->
+                <div class="form-group">
+                    <label class="form-label">Custom Style (JSON)</label>
+                    <textarea id="custom-style-json" class="form-input" rows="8" 
+                        placeholder='[{"featureType": "water", "elementType": "geometry", "stylers": [{"color": "#c9c9c9"}]}]'
+                        style="font-family: monospace; font-size: 12px;"></textarea>
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                        <button class="btn btn-primary" onclick="applyCustomMapStyle()">
+                            <i class="fas fa-check"></i> Apply Custom Style
+                        </button>
+                        <button class="btn" onclick="clearCustomMapStyle()">
+                            <i class="fas fa-times"></i> Clear Custom
+                        </button>
+                    </div>
+                    <div style="margin-top: 8px; font-size: 11px; opacity: 0.7;">
+                        Use <a href="https://mapstyle.withgoogle.com/" target="_blank" style="color: var(--accent-blue);">Google Maps Styling Wizard</a> to generate JSON
+                    </div>
+                </div>
+                
+                <!-- Quick Color Controls -->
+                <div class="form-group">
+                    <label class="form-label">Quick Style Controls</label>
+                    <div style="background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-bottom: 16px;">
+                        
+                        <!-- Background Color -->
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <div style="min-width: 100px; font-size: 12px;">Background</div>
+                            <input type="color" id="quick-bg-color" class="form-input" value="#f5f5f5" oninput="updateQuickStyle()" style="width: 50px; height: 32px; padding: 2px;">
+                            <input type="range" id="quick-bg-lightness" min="-100" max="100" value="20" oninput="updateQuickStyle()" style="flex: 1;">
+                            <span id="quick-bg-lightness-val" style="min-width: 40px; font-size: 11px; opacity: 0.7;">20</span>
+                        </div>
+                        
+                        <!-- Roads Color -->
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <div style="min-width: 100px; font-size: 12px;">Roads</div>
+                            <input type="color" id="quick-road-color" class="form-input" value="#e5e5e5" oninput="updateQuickStyle()" style="width: 50px; height: 32px; padding: 2px;">
+                            <input type="range" id="quick-road-saturation" min="-100" max="100" value="0" oninput="updateQuickStyle()" style="flex: 1;">
+                            <span id="quick-road-saturation-val" style="min-width: 40px; font-size: 11px; opacity: 0.7;">0</span>
+                        </div>
+                        
+                        <!-- Water Color -->
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <div style="min-width: 100px; font-size: 12px;">Water</div>
+                            <input type="color" id="quick-water-color" class="form-input" value="#c9c9c9" oninput="updateQuickStyle()" style="width: 50px; height: 32px; padding: 2px;">
+                            <input type="range" id="quick-water-saturation" min="-100" max="100" value="0" oninput="updateQuickStyle()" style="flex: 1;">
+                            <span id="quick-water-saturation-val" style="min-width: 40px; font-size: 11px; opacity: 0.7;">0</span>
+                        </div>
+                        
+                        <!-- Labels Color -->
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <div style="min-width: 100px; font-size: 12px;">Labels</div>
+                            <input type="color" id="quick-label-color" class="form-input" value="#616161" oninput="updateQuickStyle()" style="width: 50px; height: 32px; padding: 2px;">
+                            <input type="range" id="quick-label-lightness" min="-100" max="100" value="0" oninput="updateQuickStyle()" style="flex: 1;">
+                            <span id="quick-label-lightness-val" style="min-width: 40px; font-size: 11px; opacity: 0.7;">0</span>
+                        </div>
+                        
+                        <!-- Overall Gamma -->
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <div style="min-width: 100px; font-size: 12px;">Contrast (γ)</div>
+                            <input type="range" id="quick-gamma" min="0.1" max="3" step="0.1" value="1.0" oninput="updateQuickStyle()" style="flex: 1;">
+                            <span id="quick-gamma-val" style="min-width: 40px; font-size: 11px; opacity: 0.7;">1.0</span>
+                        </div>
+                        
+                        <!-- Toggle Controls -->
+                        <div style="display: flex; gap: 16px; margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.1);">
+                            <label style="font-size: 12px; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                                <input type="checkbox" id="quick-hide-poi" onchange="updateQuickStyle()"> Hide POI
+                            </label>
+                            <label style="font-size: 12px; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                                <input type="checkbox" id="quick-hide-labels" onchange="updateQuickStyle()"> Hide Labels
+                            </label>
+                            <label style="font-size: 12px; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                                <input type="checkbox" id="quick-hide-transit" onchange="updateQuickStyle()"> Hide Transit
+                            </label>
+                        </div>
+                        
+                        <div style="display: flex; gap: 8px; margin-top: 16px;">
+                            <button class="btn btn-primary" onclick="saveQuickStyle()" style="flex: 1;">
+                                <i class="fas fa-save"></i> Save Style
+                            </button>
+                            <button class="btn" onclick="resetQuickStyle()" style="flex: 1;">
+                                <i class="fas fa-undo"></i> Reset
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Advanced Style Builder -->
+                <div class="form-group">
+                    <div class="manual-fields-toggle" onclick="toggleAdvancedBuilder()" style="cursor: pointer; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 8px; margin-bottom: 0; display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary);">
+                            <i class="fas fa-code"></i> Advanced Style Builder (JSON)
+                        </span>
+                        <i class="fas fa-chevron-down advanced-builder-chevron" style="color: var(--text-secondary); transition: transform 0.2s;"></i>
+                    </div>
+                    
+                    <div id="advanced-builder-container" class="manual-fields collapsed" style="margin-top: 12px;">
+                        <label class="form-label">Visual Style Builder (Generate JSON)</label>
+                        <div style="background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px;">
+                            
+                            <!-- Feature Type Selection -->
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-size: 11px; text-transform: uppercase; opacity: 0.7; display: block; margin-bottom: 4px;">Feature Type</label>
+                                <select id="style-feature-type" class="form-input" style="font-size: 12px;">
+                                    <option value="all">All Features</option>
+                                    <option value="water">Water</option>
+                                    <option value="road">Roads (All)</option>
+                                    <option value="road.highway">Roads - Highway</option>
+                                    <option value="road.arterial">Roads - Arterial</option>
+                                    <option value="road.local">Roads - Local</option>
+                                    <option value="landscape">Landscape</option>
+                                    <option value="poi">Points of Interest</option>
+                                    <option value="transit">Transit</option>
+                                    <option value="administrative">Administrative</option>
+                                </select>
+                            </div>
+                            
+                            <!-- Element Type Selection -->
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-size: 11px; text-transform: uppercase; opacity: 0.7; display: block; margin-bottom: 4px;">Element Type</label>
+                                <select id="style-element-type" class="form-input" style="font-size: 12px;">
+                                    <option value="all">All Elements</option>
+                                    <option value="geometry">Geometry</option>
+                                    <option value="geometry.fill">Geometry - Fill</option>
+                                    <option value="geometry.stroke">Geometry - Stroke</option>
+                                    <option value="labels">Labels</option>
+                                    <option value="labels.text">Labels - Text</option>
+                                    <option value="labels.text.fill">Labels - Text Fill</option>
+                                    <option value="labels.text.stroke">Labels - Text Stroke</option>
+                                    <option value="labels.icon">Labels - Icon</option>
+                                </select>
+                            </div>
+                            
+                            <!-- Stylers -->
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                                <div>
+                                    <label style="font-size: 11px; opacity: 0.7;">Color</label>
+                                    <input type="color" id="style-color" class="form-input" style="height: 32px; padding: 2px;">
+                                </div>
+                                <div>
+                                    <label style="font-size: 11px; opacity: 0.7;">Visibility</label>
+                                    <select id="style-visibility" class="form-input" style="font-size: 12px;">
+                                        <option value="">Default</option>
+                                        <option value="on">On</option>
+                                        <option value="off">Off</option>
+                                        <option value="simplified">Simplified</option>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                                <div>
+                                    <label style="font-size: 11px; opacity: 0.7;">Lightness (-100 to 100)</label>
+                                    <input type="number" id="style-lightness" class="form-input" min="-100" max="100" step="5" placeholder="0" style="font-size: 12px;">
+                                </div>
+                                <div>
+                                    <label style="font-size: 11px; opacity: 0.7;">Saturation (-100 to 100)</label>
+                                    <input type="number" id="style-saturation" class="form-input" min="-100" max="100" step="5" placeholder="0" style="font-size: 12px;">
+                                </div>
+                            </div>
+                            
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                                <div>
+                                    <label style="font-size: 11px; opacity: 0.7;">Gamma (0.01 to 10)</label>
+                                    <input type="number" id="style-gamma" class="form-input" min="0.01" max="10" step="0.1" placeholder="1.0" style="font-size: 12px;">
+                                </div>
+                                <div>
+                                    <label style="font-size: 11px; opacity: 0.7;">Weight (line thickness)</label>
+                                    <input type="number" id="style-weight" class="form-input" min="0" max="10" step="0.5" placeholder="1" style="font-size: 12px;">
+                                </div>
+                            </div>
+                            
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-size: 11px; opacity: 0.7; display: flex; align-items: center; gap: 8px;">
+                                    <input type="checkbox" id="style-invert-lightness"> Invert Lightness
+                                </label>
+                            </div>
+                            
+                            <div style="display: flex; gap: 8px;">
+                                <button class="btn btn-primary" onclick="addStyleRule()" style="flex: 1;">
+                                    <i class="fas fa-plus"></i> Add to JSON
+                                </button>
+                                <button class="btn" onclick="clearStyleBuilder()">
+                                    <i class="fas fa-eraser"></i> Clear
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+            </div>
+            
+            <!-- Section: Data Management -->
+            <div>
+                <h3 style="margin-bottom: 16px; font-size: 18px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--glass-border); padding-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="toggleSettingsSection('data-management-section')">
+                    <span><i class="fas fa-database"></i> Data Management</span>
+                    <i class="fas fa-chevron-down" id="data-management-section-icon"></i>
+                </h3>
+                <div id="data-management-section" style="display: none;">
+                
+                <div style="display: flex; flex-direction: column; gap: 12px;">
+                    <button class="btn btn-primary" onclick="exportData()">
+                        <i class="fas fa-download"></i> Export All Data (JSON)
+                    </button>
+                    
+                    <input type="file" id="import-file" accept=".json" style="display: none;" onchange="importData(this)">
+                    <button class="btn btn-success" onclick="document.getElementById('import-file').click()">
+                        <i class="fas fa-upload"></i> Import Data (JSON)
+                    </button>
+                    
+                    <button class="btn btn-danger" onclick="hardReset()">
+                        <i class="fas fa-exclamation-triangle"></i> Factory Reset (Delete All Data)
+                    </button>
+                </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- JavaScript Kernels (load in order) -->
+<script src="js/kernel-core.js?v=91"></script>
+<script src="js/kernel-timing.js?v=91"></script>
+<script src="js/kernel-data.js?v=91"></script>
+<script src="js/kernel-map.js?v=91"></script>
+<script src="js/kernel-dispatch.js?v=91"></script>
+<script src="js/kernel-live.js?v=91"></script>
+<script src="js/kernel-preparser.js?v=91"></script>
+
+<!-- Initialize Queue Timers after all kernels loaded -->
+<script>
+(function() {
+    if (typeof STATE !== 'undefined' && STATE.intervals) {
+        if (STATE.intervals.queueTimers) clearInterval(STATE.intervals.queueTimers);
+        STATE.intervals.queueTimers = setInterval(function() {
+            if (typeof updateQueueTimers === 'function') {
+                updateQueueTimers();
+            }
+        }, 1000);
+        console.log('⏱️ Queue timers interval initialized');
+    }
+    
+    // Initialize PreParser for real-time call intake
+    if (typeof PreParser !== 'undefined') {
+        PreParser.init();
+    }
+})();
+</script>
+
+<!-- Google Maps API (loads last, calls initMap) -->
+<script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=***REMOVED***&libraries=places,geometry&callback=initMap">
+</script>
+
+</body>
+</html>
